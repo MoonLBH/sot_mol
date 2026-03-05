@@ -152,6 +152,21 @@ class GRPO_Lightning(SC_Lightning):
 
         return logp
 
+    def _categorical_logprob(self, sample_idx, probs, masks, pairwise=False):
+        safe_probs = probs.clamp_min(self.reward_norm_eps)
+        sample_idx = sample_idx.long().unsqueeze(-1)
+        chosen = torch.gather(safe_probs, dim=-1, index=sample_idx).squeeze(-1)
+        logp = torch.log(chosen)
+
+        if pairwise:
+            pair_mask = (masks.unsqueeze(1) * masks.unsqueeze(2)).float()
+            logp = (logp * pair_mask).sum(dim=(1, 2))
+        else:
+            atom_mask = masks.float()
+            logp = (logp * atom_mask).sum(dim=1)
+
+        return logp
+
     def _group_advantages(self, rewards):
         advantages = torch.zeros_like(rewards)
         n = rewards.size(0)
@@ -227,7 +242,7 @@ class GRPO_Lightning(SC_Lightning):
                 coord_noise = torch.randn_like(mean_coords) * std_coords
                 next_coords = (mean_coords + coord_noise) * flag_3Ds.view(-1, 1, 1)
 
-                logprob = self._gaussian_logprob(
+                coord_logprob = self._gaussian_logprob(
                     next_coords,
                     mean_coords,
                     std_coords,
@@ -250,6 +265,23 @@ class GRPO_Lightning(SC_Lightning):
                     cat_noise_level=cat_noise_level,
                 )
 
+                next_atomics_idx = torch.argmax(next_atomics, dim=-1)
+                next_bonds_idx = torch.argmax(next_bonds, dim=-1)
+
+                atom_logprob = self._categorical_logprob(
+                    next_atomics_idx,
+                    type_probs,
+                    curr["masks"],
+                    pairwise=False,
+                )
+                bond_logprob = self._categorical_logprob(
+                    next_bonds_idx,
+                    bond_probs,
+                    curr["masks"],
+                    pairwise=True,
+                )
+                logprob = coord_logprob + atom_logprob + bond_logprob
+
                 transitions.append(
                     {
                         "coords": curr["coords"].detach(),
@@ -263,6 +295,8 @@ class GRPO_Lightning(SC_Lightning):
                         "times": times.detach(),
                         "step_size": torch.full_like(times, step_size).detach(),
                         "next_coords": next_coords.detach(),
+                        "next_atomics_idx": next_atomics_idx.detach(),
+                        "next_bonds_idx": next_bonds_idx.detach(),
                         "old_logprob": logprob.detach(),
                     }
                 )
@@ -310,7 +344,7 @@ class GRPO_Lightning(SC_Lightning):
             "bonds": transition["cond_bonds"],
         }
 
-        coords, _, _, _ = self(
+        coords, type_logits, bond_logits, _ = self(
             state,
             times,
             training=True,
@@ -321,13 +355,31 @@ class GRPO_Lightning(SC_Lightning):
         mean_coords = self._coord_mean_update(state["coords"], coords, times, step_size[0].item())
         std_coords = self._coord_std(times, step_size[0].item())
 
-        return self._gaussian_logprob(
+        coord_logprob = self._gaussian_logprob(
             transition["next_coords"],
             mean_coords,
             std_coords,
             transition["masks"],
             flag_3Ds=flag_3Ds,
         )
+
+        type_probs = F.softmax(type_logits, dim=-1)
+        bond_probs = F.softmax(bond_logits, dim=-1)
+
+        atom_logprob = self._categorical_logprob(
+            transition["next_atomics_idx"],
+            type_probs,
+            transition["masks"],
+            pairwise=False,
+        )
+        bond_logprob = self._categorical_logprob(
+            transition["next_bonds_idx"],
+            bond_probs,
+            transition["masks"],
+            pairwise=True,
+        )
+
+        return coord_logprob + atom_logprob + bond_logprob
 
     def _transition_ref_kl(self, transition):
         if (not self.use_reference_policy) or (self.ref_gen is None):

@@ -62,5 +62,6 @@ model.Train(
     debug=False,
     ngpus=1,
     batchsize=4,
+    max_steps=16,
     log_steps=1,
 )

@@ -102,6 +102,7 @@ class MolGen_GRPOModel(MolGen_Model):
         gradient_clip_val=1.0,
         ngpus=1,
         batchsize=16,
+        max_steps=None,
     ):
         self.data_module = MGDataModule(
             self.vocab,
@@ -125,6 +126,8 @@ class MolGen_GRPOModel(MolGen_Model):
             "lr": lr,
             "warm_up_steps": warm_up_steps,
         }
+        if max_steps is not None:
+            training_hparams["max_steps"] = max_steps
         self.lightning_module = self.create_lightning_module(
             hparams=training_hparams,
             load_ckpt=load_ckpt,

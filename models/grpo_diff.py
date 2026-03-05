@@ -257,6 +257,9 @@ class GRPO_Lightning(SC_Lightning):
                         "bonds": curr["bonds"].detach(),
                         "masks": curr["masks"].detach(),
                         "flag_3Ds": flag_3Ds.detach(),
+                        "cond_coords": None if cond is None else cond["coords"].detach(),
+                        "cond_atomics": None if cond is None else cond["atomics"].detach(),
+                        "cond_bonds": None if cond is None else cond["bonds"].detach(),
                         "times": times.detach(),
                         "step_size": torch.full_like(times, step_size).detach(),
                         "next_coords": next_coords.detach(),
@@ -301,11 +304,17 @@ class GRPO_Lightning(SC_Lightning):
         flag_3Ds = transition["flag_3Ds"]
         step_size = transition["step_size"]
 
+        cond_batch = {
+            "coords": transition["cond_coords"],
+            "atomics": transition["cond_atomics"],
+            "bonds": transition["cond_bonds"],
+        }
+
         coords, _, _, _ = self(
             state,
             times,
             training=True,
-            cond_batch={"coords": None, "atomics": None, "bonds": None},
+            cond_batch=cond_batch,
             flag_3Ds=flag_3Ds,
         )
 
@@ -335,11 +344,17 @@ class GRPO_Lightning(SC_Lightning):
         flag_3Ds = transition["flag_3Ds"]
         step_size = transition["step_size"]
 
+        cond_batch = {
+            "coords": transition["cond_coords"],
+            "atomics": transition["cond_atomics"],
+            "bonds": transition["cond_bonds"],
+        }
+
         coords_new, _, _, _ = self(
             state,
             times,
             training=True,
-            cond_batch={"coords": None, "atomics": None, "bonds": None},
+            cond_batch=cond_batch,
             flag_3Ds=flag_3Ds,
         )
 
@@ -348,7 +363,7 @@ class GRPO_Lightning(SC_Lightning):
                 self.ref_gen,
                 state,
                 times,
-                cond_batch=None,
+                cond_batch=cond_batch,
                 flag_3Ds=flag_3Ds,
             )
 

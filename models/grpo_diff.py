@@ -456,8 +456,9 @@ class GRPO_Lightning(SC_Lightning):
             device=generated["coords"].device,
         )
 
-        clipped_objectives = []
-        kls = []
+        clip_obj_sum = None
+        kl_sum = None
+        n_steps = 0
         for transition in transitions:
             new_logprob = self._transition_new_logprob(transition)
             old_logprob = transition["old_logprob"]
@@ -467,12 +468,15 @@ class GRPO_Lightning(SC_Lightning):
 
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
-            clipped_objectives.append(torch.minimum(surr1, surr2).mean())
+            step_clip_obj = torch.minimum(surr1, surr2).mean()
+            step_kl = self._transition_ref_kl(transition)
 
-            kls.append(self._transition_ref_kl(transition))
+            clip_obj_sum = step_clip_obj if clip_obj_sum is None else (clip_obj_sum + step_clip_obj)
+            kl_sum = step_kl if kl_sum is None else (kl_sum + step_kl)
+            n_steps += 1
 
-        clip_obj = torch.stack(clipped_objectives).mean()
-        kl_loss = torch.stack(kls).mean() if len(kls) > 0 else torch.tensor(0.0, device=clip_obj.device)
+        clip_obj = clip_obj_sum / max(n_steps, 1)
+        kl_loss = kl_sum / max(n_steps, 1)
         total_loss = -clip_obj + (self.kl_beta * kl_loss)
 
         self.log("train-grpo-objective", clip_obj, on_step=True, on_epoch=True, logger=True, sync_dist=True)

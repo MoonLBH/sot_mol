@@ -102,6 +102,7 @@ class MolGen_GRPOModel(MolGen_Model):
         gradient_clip_val=1.0,
         ngpus=1,
         batchsize=16,
+        mini_batchsize=4,
         max_steps=None,
     ):
         self.data_module = MGDataModule(
@@ -115,7 +116,7 @@ class MolGen_GRPOModel(MolGen_Model):
             scale_ot=self.scale_ot,
             scale_ot_factor=0.2,
             batchsize=batchsize,
-            mini_batchsize=4,
+            mini_batchsize=mini_batchsize,
             with_Hs=self.with_Hs,
             ot_geo_weight=self.ot_geo_weight,
             ot_type_weight=self.ot_type_weight,

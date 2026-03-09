@@ -108,14 +108,16 @@ class MolGen_GRPOModel(MolGen_Model):
         mini_batchsize=4,
         max_steps=None,
         cache_on_cpu=None,
+        exp_tag=None,
     ):
         if not debug:
             os.makedirs("./TensorBoard", exist_ok=True)
-            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
+            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=exp_tag)
             exp_dir = logger.log_dir
         else:
             logger = None
-            exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            if exp_tag is None:
+                exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
             exp_dir = os.path.join(save_path, f"{project_name}_debug_{exp_tag}")
             
         self.data_module = MGDataModule(
@@ -163,7 +165,8 @@ class MolGen_GRPOModel(MolGen_Model):
         checkpointing = ModelCheckpoint(
             dirpath=ckpt_dir,
             save_top_k=5,
-            every_n_epochs=1,
+            # every_n_epochs=1,
+            every_n_train_steps=100,   # 例子：每1000个global step检查一次
             monitor="train-grpo-reward-mean",
             mode="max",
             save_last=True,

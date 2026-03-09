@@ -301,7 +301,14 @@ class MolGen_Model:
                     "flag_3Ds":batch["flag_3Ds"],
                     }
             
-            output = cuda_model._generate(noise, steps, coms=batch["coms"])
+            coms = batch.get("coms", None)
+            # Sampling dataloaders from different pipelines may carry CoMs as [B, 3]
+            # or expanded/padded tensors like [B, N, 3]. Normalise to [B, 3]
+            # so `_generate` can broadcast-add safely to coords [B, n_atoms, 3].
+            if coms is not None and coms.dim() == 3:
+                coms = coms.mean(dim=1)
+
+            output = cuda_model._generate(noise, steps, coms=coms)
             outputs.append(output)
 
         molecules = [cuda_model._generate_mols(output) for output in outputs]

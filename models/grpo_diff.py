@@ -6,6 +6,8 @@ import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import QED
 import os
+import numpy as np
+from torch.distributions import Normal
 
 from .diff import SC_Lightning
 
@@ -67,6 +69,7 @@ class GRPO_Lightning(SC_Lightning):
         self.cache_on_cpu = cache_on_cpu
         self.grad_clip_val = grad_clip_val
         self.val_save_path = val_save_path
+        self.coord_noise_std = default_coord_noise_std
 
         self.ref_gen = None
         # Use manual optimization so each transition can backward independently,
@@ -264,11 +267,12 @@ class GRPO_Lightning(SC_Lightning):
         )
 
     def _collect_rollout(self, noise, model, inference_steps, cat_noise_level):
-        time_points = torch.linspace(0.0, 1.0, inference_steps + 1, device=noise["coords"].device)
-        step_sizes = (time_points[1:] - time_points[:-1]).tolist()
+        time_points = np.linspace(0, 1, inference_steps + 1).tolist()
+        step_sizes = [t1 - t0 for t0, t1 in zip(time_points[:-1], time_points[1:])]
 
         curr = {k: v.clone() for k, v in noise.items()}
         times = torch.zeros(noise["coords"].size(0), device=noise["coords"].device)
+        atom_mask = curr["masks"].unsqueeze(2)
         flag_3Ds = noise["flag_3Ds"]
 
         cond_batch = {
@@ -293,19 +297,16 @@ class GRPO_Lightning(SC_Lightning):
                 type_probs = F.softmax(type_logits, dim=-1)
                 bond_probs = F.softmax(bond_logits, dim=-1)
                 charge_probs = F.softmax(charge_logits, dim=-1)
+                
+                coord_velocity = (coords - curr["coords"]) / (1 - times.view(-1, 1, 1))
+                coord_mean = curr["coords"] + step_size * coord_velocity
+                coord_std = step_size * self.coord_noise_std
+                coord_noise = torch.randn_like(coord_mean) * coord_std
+                next_coords = (coord_mean + coord_noise)
 
-                mean_coords = self._coord_mean_update(curr["coords"], coords, times, step_size)
-                std_coords = self._coord_std(times, step_size)
-                coord_noise = torch.randn_like(mean_coords) * std_coords
-                next_coords = (mean_coords + coord_noise) * flag_3Ds.view(-1, 1, 1)
-
-                coord_logprob = self._gaussian_logprob(
-                    next_coords,
-                    mean_coords,
-                    std_coords,
-                    curr["masks"],
-                    flag_3Ds=flag_3Ds,
-                )
+                coord_logprob = Normal(coord_mean, coord_std).log_prob(next_coords)
+                coord_logprob = (coord_logprob * atom_mask).sum(dim=(1,2))
+                coord_logprob = coord_logprob * flag_3Ds.view(-1)
 
                 next_atomics = self._uniform_sample_step(
                     curr["atomics"],
@@ -400,19 +401,16 @@ class GRPO_Lightning(SC_Lightning):
             flag_3Ds=flag_3Ds,
         )
 
-        mean_new = self._coord_mean_update(state["coords"], coords_new, times, step_size[0].item())
-        std = self._coord_std(times, step_size[0].item())
+        coord_velocity = (coords_new - state["coords"]) / (1 - times.view(-1, 1, 1))
+        coord_mean = state["coords"] + step_size[0].item() * coord_velocity
+        coord_std = torch.full_like(coord_mean, step_size[0].item() * self.coord_noise_std)
 
         type_probs_new = F.softmax(type_logits_new, dim=-1)
         bond_probs_new = F.softmax(bond_logits_new, dim=-1)
 
-        coord_logprob = self._gaussian_logprob(
-            transition["next_coords"],
-            mean_new,
-            std,
-            transition["masks"],
-            flag_3Ds=flag_3Ds,
-        )
+        coord_logprob = Normal(coord_mean, coord_std).log_prob(transition["next_coords"])
+        coord_logprob = (coord_logprob * transition["masks"]).sum(dim=(1, 2))
+        coord_logprob = coord_logprob * flag_3Ds.view(-1)
         atom_logprob = self._categorical_logprob(
             transition["next_atomics_idx"],
             type_probs_new,
@@ -440,11 +438,13 @@ class GRPO_Lightning(SC_Lightning):
                     flag_3Ds=flag_3Ds,
                 )
 
-            mean_ref = self._coord_mean_update(state["coords"], coords_ref, times, step_size[0].item())
+            # mean_ref = self._coord_mean_update(state["coords"], coords_ref, times, step_size[0].item())
+            coord_velocity_ref = (coords_ref - state["coords"]) / (1 - times.view(-1, 1, 1))
+            coord_mean_ref = state["coords"] + step_size[0].item() * coord_velocity_ref
             type_probs_ref = F.softmax(type_logits_ref, dim=-1)
             bond_probs_ref = F.softmax(bond_logits_ref, dim=-1)
 
-            coord_kl = self._coord_kl(mean_new, mean_ref, std, transition["masks"], flag_3Ds=flag_3Ds)
+            coord_kl = self._coord_kl(coord_mean, coord_mean_ref, coord_std, transition["masks"], flag_3Ds=flag_3Ds)
             atom_kl = self._categorical_kl(type_probs_new, type_probs_ref, transition["masks"], pairwise=False)
             bond_kl = self._categorical_kl(bond_probs_new, bond_probs_ref, transition["masks"], pairwise=True)
             # Masked means prevent bond KL (O(N^2)) from dominating due to tensor size.
@@ -489,7 +489,11 @@ class GRPO_Lightning(SC_Lightning):
             dtype=generated["coords"].dtype,
             device=generated["coords"].device,
         )
-        if self.current_epoch == 0 or self.current_epoch >= 100:
+        if (
+            self.val_save_path is not None
+            and self.global_rank == 0
+            and self.global_step % 100 == 0
+        ):
             os.makedirs(self.val_save_path, exist_ok=True)
             save_file = os.path.join(
                 self.val_save_path,

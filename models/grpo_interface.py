@@ -61,6 +61,7 @@ class MolGen_GRPOModel(MolGen_Model):
             "reward_norm_eps": self.reward_norm_eps,
             "ratio_max": self.ratio_max,
             "use_reference_policy": self.use_reference_policy,
+            "cache_on_cpu": True,
         }
 
         if hparams is not None:
@@ -104,6 +105,7 @@ class MolGen_GRPOModel(MolGen_Model):
         batchsize=16,
         mini_batchsize=4,
         max_steps=None,
+        cache_on_cpu=None,
     ):
         self.data_module = MGDataModule(
             self.vocab,
@@ -129,6 +131,8 @@ class MolGen_GRPOModel(MolGen_Model):
         }
         if max_steps is not None:
             training_hparams["max_steps"] = max_steps
+        if cache_on_cpu is not None:
+            training_hparams["cache_on_cpu"] = cache_on_cpu
         self.lightning_module = self.create_lightning_module(
             hparams=training_hparams,
             load_ckpt=load_ckpt,

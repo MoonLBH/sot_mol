@@ -64,5 +64,6 @@ model.Train(
     batchsize=4,
     mini_batchsize=1,
     max_steps=16,
+    cache_on_cpu=True,
     log_steps=1,
 )

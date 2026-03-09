@@ -34,6 +34,7 @@ class GRPO_Lightning(SC_Lightning):
         reward_norm_eps: float = 1e-6,
         ratio_max: float = 20.0,
         use_reference_policy: bool = True,
+        cache_on_cpu: bool = True,
     ):
         super().__init__(
             gen=gen,
@@ -60,8 +61,12 @@ class GRPO_Lightning(SC_Lightning):
         self.reward_norm_eps = reward_norm_eps
         self.ratio_max = ratio_max
         self.use_reference_policy = use_reference_policy
+        self.cache_on_cpu = cache_on_cpu
 
         self.ref_gen = None
+        # Use manual optimization so each transition can backward independently,
+        # avoiding a single giant graph over all rollout steps.
+        self.automatic_optimization = False
 
     def on_fit_start(self):
         super().on_fit_start()
@@ -70,6 +75,26 @@ class GRPO_Lightning(SC_Lightning):
             self.ref_gen.eval()
             for param in self.ref_gen.parameters():
                 param.requires_grad = False
+
+    def _cache_tensor(self, tensor):
+        if tensor is None:
+            return None
+        tensor = tensor.detach()
+        if self.cache_on_cpu:
+            return tensor.cpu()
+        return tensor
+
+    def _transition_to_device(self, transition, device):
+        if not self.cache_on_cpu:
+            return transition
+
+        moved = {}
+        for key, value in transition.items():
+            if isinstance(value, torch.Tensor):
+                moved[key] = value.to(device, non_blocking=True)
+            else:
+                moved[key] = value
+        return moved
 
     def _compute_rewards_from_generated(self, generated):
         mols = self._generate_mols(generated, sanitise=True)
@@ -166,6 +191,33 @@ class GRPO_Lightning(SC_Lightning):
             logp = (logp * atom_mask).sum(dim=1)
 
         return logp
+
+    def _categorical_kl(self, probs_new, probs_ref, masks, pairwise=False):
+        kl = F.kl_div(
+            torch.log(probs_new.clamp_min(self.reward_norm_eps)),
+            probs_ref.clamp_min(self.reward_norm_eps),
+            reduction="none",
+        ).sum(dim=-1)
+
+        if pairwise:
+            pair_mask = (masks.unsqueeze(1) * masks.unsqueeze(2)).float()
+            denom = pair_mask.sum(dim=(1, 2)).clamp_min(1.0)
+            kl = (kl * pair_mask).sum(dim=(1, 2)) / denom
+        else:
+            atom_mask = masks.float()
+            denom = atom_mask.sum(dim=1).clamp_min(1.0)
+            kl = (kl * atom_mask).sum(dim=1) / denom
+
+        return kl
+
+    def _coord_kl(self, mean_new, mean_ref, std, masks, flag_3Ds=None):
+        kl = ((mean_new - mean_ref) ** 2) / (2.0 * (std ** 2).clamp_min(self.reward_norm_eps))
+        atom_mask = masks.unsqueeze(-1).float()
+        denom = atom_mask.sum(dim=(1, 2)).clamp_min(1.0)
+        kl = (kl * atom_mask).sum(dim=(1, 2)) / denom
+        if flag_3Ds is not None:
+            kl = kl * flag_3Ds.view(-1)
+        return kl
 
     def _group_advantages(self, rewards):
         advantages = torch.zeros_like(rewards)
@@ -268,36 +320,26 @@ class GRPO_Lightning(SC_Lightning):
                 next_atomics_idx = torch.argmax(next_atomics, dim=-1)
                 next_bonds_idx = torch.argmax(next_bonds, dim=-1)
 
-                atom_logprob = self._categorical_logprob(
-                    next_atomics_idx,
-                    type_probs,
-                    curr["masks"],
-                    pairwise=False,
-                )
-                bond_logprob = self._categorical_logprob(
-                    next_bonds_idx,
-                    bond_probs,
-                    curr["masks"],
-                    pairwise=True,
-                )
-                logprob = coord_logprob + atom_logprob + bond_logprob
+                atom_logprob = self._categorical_logprob(next_atomics_idx, type_probs, curr["masks"], pairwise=False)
+                bond_logprob = self._categorical_logprob(next_bonds_idx, bond_probs, curr["masks"], pairwise=True)
+                old_logprob = coord_logprob + atom_logprob + bond_logprob
 
                 transitions.append(
                     {
-                        "coords": curr["coords"].detach(),
-                        "atomics": curr["atomics"].detach(),
-                        "bonds": curr["bonds"].detach(),
-                        "masks": curr["masks"].detach(),
-                        "flag_3Ds": flag_3Ds.detach(),
-                        "cond_coords": None if cond is None else cond["coords"].detach(),
-                        "cond_atomics": None if cond is None else cond["atomics"].detach(),
-                        "cond_bonds": None if cond is None else cond["bonds"].detach(),
-                        "times": times.detach(),
-                        "step_size": torch.full_like(times, step_size).detach(),
-                        "next_coords": next_coords.detach(),
-                        "next_atomics_idx": next_atomics_idx.detach(),
-                        "next_bonds_idx": next_bonds_idx.detach(),
-                        "old_logprob": logprob.detach(),
+                        "coords": self._cache_tensor(curr["coords"]),
+                        "atomics": self._cache_tensor(curr["atomics"]),
+                        "bonds": self._cache_tensor(curr["bonds"]),
+                        "masks": self._cache_tensor(curr["masks"]),
+                        "flag_3Ds": self._cache_tensor(flag_3Ds),
+                        "cond_coords": self._cache_tensor(None if cond is None else cond["coords"]),
+                        "cond_atomics": self._cache_tensor(None if cond is None else cond["atomics"]),
+                        "cond_bonds": self._cache_tensor(None if cond is None else cond["bonds"]),
+                        "times": self._cache_tensor(times),
+                        "step_size": self._cache_tensor(torch.full_like(times, step_size)),
+                        "next_coords": self._cache_tensor(next_coords),
+                        "next_atomics_idx": self._cache_tensor(next_atomics_idx),
+                        "next_bonds_idx": self._cache_tensor(next_bonds_idx),
+                        "old_logprob": self._cache_tensor(old_logprob),
                     }
                 )
 
@@ -326,7 +368,7 @@ class GRPO_Lightning(SC_Lightning):
         }
         return generated, transitions
 
-    def _transition_new_logprob(self, transition):
+    def _transition_step_stats(self, transition):
         state = {
             "coords": transition["coords"],
             "atomics": transition["atomics"],
@@ -335,8 +377,8 @@ class GRPO_Lightning(SC_Lightning):
         }
 
         times = transition["times"]
-        flag_3Ds = transition["flag_3Ds"]
         step_size = transition["step_size"]
+        flag_3Ds = transition["flag_3Ds"]
 
         cond_batch = {
             "coords": transition["cond_coords"],
@@ -344,7 +386,8 @@ class GRPO_Lightning(SC_Lightning):
             "bonds": transition["cond_bonds"],
         }
 
-        coords, type_logits, bond_logits, _ = self(
+        # Merge current-policy computations into a single forward pass per transition.
+        coords_new, type_logits_new, bond_logits_new, _ = self(
             state,
             times,
             training=True,
@@ -352,81 +395,57 @@ class GRPO_Lightning(SC_Lightning):
             flag_3Ds=flag_3Ds,
         )
 
-        mean_coords = self._coord_mean_update(state["coords"], coords, times, step_size[0].item())
-        std_coords = self._coord_std(times, step_size[0].item())
+        mean_new = self._coord_mean_update(state["coords"], coords_new, times, step_size[0].item())
+        std = self._coord_std(times, step_size[0].item())
+
+        type_probs_new = F.softmax(type_logits_new, dim=-1)
+        bond_probs_new = F.softmax(bond_logits_new, dim=-1)
 
         coord_logprob = self._gaussian_logprob(
             transition["next_coords"],
-            mean_coords,
-            std_coords,
+            mean_new,
+            std,
             transition["masks"],
             flag_3Ds=flag_3Ds,
         )
-
-        type_probs = F.softmax(type_logits, dim=-1)
-        bond_probs = F.softmax(bond_logits, dim=-1)
-
         atom_logprob = self._categorical_logprob(
             transition["next_atomics_idx"],
-            type_probs,
+            type_probs_new,
             transition["masks"],
             pairwise=False,
         )
         bond_logprob = self._categorical_logprob(
             transition["next_bonds_idx"],
-            bond_probs,
+            bond_probs_new,
             transition["masks"],
             pairwise=True,
         )
+        new_logprob = coord_logprob + atom_logprob + bond_logprob
 
-        return coord_logprob + atom_logprob + bond_logprob
-
-    def _transition_ref_kl(self, transition):
         if (not self.use_reference_policy) or (self.ref_gen is None):
-            return torch.tensor(0.0, device=transition["coords"].device)
+            step_kl = torch.zeros((), device=new_logprob.device, dtype=new_logprob.dtype)
+        else:
+            # Reference policy is only used for KL, so run it no-grad.
+            with torch.no_grad():
+                coords_ref, type_logits_ref, bond_logits_ref, _ = self._forward_with_model(
+                    self.ref_gen,
+                    state,
+                    times,
+                    cond_batch=cond_batch,
+                    flag_3Ds=flag_3Ds,
+                )
 
-        state = {
-            "coords": transition["coords"],
-            "atomics": transition["atomics"],
-            "bonds": transition["bonds"],
-            "masks": transition["masks"],
-        }
+            mean_ref = self._coord_mean_update(state["coords"], coords_ref, times, step_size[0].item())
+            type_probs_ref = F.softmax(type_logits_ref, dim=-1)
+            bond_probs_ref = F.softmax(bond_logits_ref, dim=-1)
 
-        times = transition["times"]
-        flag_3Ds = transition["flag_3Ds"]
-        step_size = transition["step_size"]
+            coord_kl = self._coord_kl(mean_new, mean_ref, std, transition["masks"], flag_3Ds=flag_3Ds)
+            atom_kl = self._categorical_kl(type_probs_new, type_probs_ref, transition["masks"], pairwise=False)
+            bond_kl = self._categorical_kl(bond_probs_new, bond_probs_ref, transition["masks"], pairwise=True)
+            # Masked means prevent bond KL (O(N^2)) from dominating due to tensor size.
+            step_kl = (coord_kl + atom_kl + bond_kl).mean()
 
-        cond_batch = {
-            "coords": transition["cond_coords"],
-            "atomics": transition["cond_atomics"],
-            "bonds": transition["cond_bonds"],
-        }
-
-        coords_new, _, _, _ = self(
-            state,
-            times,
-            training=True,
-            cond_batch=cond_batch,
-            flag_3Ds=flag_3Ds,
-        )
-
-        with torch.no_grad():
-            coords_ref, _, _, _ = self._forward_with_model(
-                self.ref_gen,
-                state,
-                times,
-                cond_batch=cond_batch,
-                flag_3Ds=flag_3Ds,
-            )
-
-        mean_new = self._coord_mean_update(state["coords"], coords_new, times, step_size[0].item())
-        mean_ref = self._coord_mean_update(state["coords"], coords_ref, times, step_size[0].item())
-        std = self._coord_std(times, step_size[0].item()).clamp_min(self.reward_norm_eps)
-
-        kl = ((mean_new - mean_ref) ** 2) / (2.0 * (std ** 2))
-        kl = (kl * transition["masks"].unsqueeze(-1).float()).sum(dim=(1, 2))
-        kl = kl * flag_3Ds.view(-1)
-        return kl.mean()
+        return new_logprob, step_kl
 
     def FM_training_step(self, batch):
         noise = {
@@ -437,15 +456,18 @@ class GRPO_Lightning(SC_Lightning):
             "flag_3Ds": batch["flag_3Ds"],
         }
 
+        # No old-policy deepcopy: old policy info is represented by cached old_logprob from rollout.
+        old_training_state = self.gen.training
+        self.gen.eval()
         with torch.no_grad():
-            old_gen = copy.deepcopy(self.gen)
-            old_gen.eval()
             generated, transitions = self._collect_rollout(
                 noise,
-                old_gen,
+                self.gen,
                 inference_steps=self.max_steps,
                 cat_noise_level=self.default_cat_noise_level,
             )
+        if old_training_state:
+            self.gen.train()
 
         rewards, generated_mols = self._compute_rewards_from_generated(generated)
         advantages = self._group_advantages(rewards)
@@ -456,12 +478,19 @@ class GRPO_Lightning(SC_Lightning):
             device=generated["coords"].device,
         )
 
-        clip_obj_sum = None
-        kl_sum = None
-        n_steps = 0
+        # Per-transition backward to avoid keeping one giant graph across all transitions.
+        opt = self.optimizers()
+        opt.zero_grad()
+
+        n_steps = max(len(transitions), 1)
+        clip_obj_sum = torch.zeros((), device=self.device)
+        kl_sum = torch.zeros((), device=self.device)
+
         for transition in transitions:
-            new_logprob = self._transition_new_logprob(transition)
+            transition = self._transition_to_device(transition, self.device)
             old_logprob = transition["old_logprob"]
+
+            new_logprob, step_kl = self._transition_step_stats(transition)
 
             ratio = torch.exp(new_logprob - old_logprob)
             ratio = torch.clamp(ratio, max=self.ratio_max)
@@ -469,14 +498,24 @@ class GRPO_Lightning(SC_Lightning):
             surr1 = ratio * advantages
             surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
             step_clip_obj = torch.minimum(surr1, surr2).mean()
-            step_kl = self._transition_ref_kl(transition)
 
-            clip_obj_sum = step_clip_obj if clip_obj_sum is None else (clip_obj_sum + step_clip_obj)
-            kl_sum = step_kl if kl_sum is None else (kl_sum + step_kl)
-            n_steps += 1
+            step_loss = (-step_clip_obj + (self.kl_beta * step_kl)) / n_steps
+            self.manual_backward(step_loss)
 
-        clip_obj = clip_obj_sum / max(n_steps, 1)
-        kl_loss = kl_sum / max(n_steps, 1)
+            clip_obj_sum = clip_obj_sum + step_clip_obj.detach()
+            kl_sum = kl_sum + step_kl.detach()
+
+            del transition
+
+        clip_val = getattr(self.trainer, "gradient_clip_val", 0.0) if self.trainer is not None else 0.0
+        if clip_val and clip_val > 0:
+            self.clip_gradients(opt, gradient_clip_val=clip_val, gradient_clip_algorithm="norm")
+
+        opt.step()
+        opt.zero_grad()
+
+        clip_obj = clip_obj_sum / n_steps
+        kl_loss = kl_sum / n_steps
         total_loss = -clip_obj + (self.kl_beta * kl_loss)
 
         self.log("train-grpo-objective", clip_obj, on_step=True, on_epoch=True, logger=True, sync_dist=True)
@@ -493,7 +532,7 @@ class GRPO_Lightning(SC_Lightning):
         self.log("train-gen-n-valid", quality_metrics["n-valid"], on_step=True, logger=True, sync_dist=True)
         self.log("train-gen-n-total", quality_metrics["n-total"], on_step=True, logger=True, sync_dist=True)
 
-        return total_loss
+        return total_loss.detach()
 
     def validation_step(self, batch, b_idx):
         return

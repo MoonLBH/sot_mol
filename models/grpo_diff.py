@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import QED
+import os
 
 from .diff import SC_Lightning
 
@@ -35,6 +36,8 @@ class GRPO_Lightning(SC_Lightning):
         ratio_max: float = 20.0,
         use_reference_policy: bool = True,
         cache_on_cpu: bool = True,
+        grad_clip_val: float = 1.0,
+        val_save_path: Optional[str] = None,
     ):
         super().__init__(
             gen=gen,
@@ -62,6 +65,8 @@ class GRPO_Lightning(SC_Lightning):
         self.ratio_max = ratio_max
         self.use_reference_policy = use_reference_policy
         self.cache_on_cpu = cache_on_cpu
+        self.grad_clip_val = grad_clip_val
+        self.val_save_path = val_save_path
 
         self.ref_gen = None
         # Use manual optimization so each transition can backward independently,
@@ -447,6 +452,13 @@ class GRPO_Lightning(SC_Lightning):
 
         return new_logprob, step_kl
 
+    def _save_mols_to_sdf(self, mols, path):
+        writer = Chem.SDWriter(path)
+        for mol in mols:
+            if mol is not None:
+                writer.write(mol)
+        writer.close()
+    
     def FM_training_step(self, batch):
         noise = {
             "coords": batch["noise_coords"],
@@ -477,6 +489,13 @@ class GRPO_Lightning(SC_Lightning):
             dtype=generated["coords"].dtype,
             device=generated["coords"].device,
         )
+        if self.current_epoch == 0 or self.current_epoch >= 100:
+            os.makedirs(self.val_save_path, exist_ok=True)
+            save_file = os.path.join(
+                self.val_save_path,
+                f"generated_epoch_{self.current_epoch}.sdf"
+            )
+            self._save_mols_to_sdf(generated_mols, save_file)
 
         # Per-transition backward to avoid keeping one giant graph across all transitions.
         opt = self.optimizers()
@@ -507,9 +526,12 @@ class GRPO_Lightning(SC_Lightning):
 
             del transition
 
-        clip_val = getattr(self.trainer, "gradient_clip_val", 0.0) if self.trainer is not None else 0.0
-        if clip_val and clip_val > 0:
-            self.clip_gradients(opt, gradient_clip_val=clip_val, gradient_clip_algorithm="norm")
+        if self.grad_clip_val is not None and self.grad_clip_val > 0:
+            self.clip_gradients(
+                opt,
+                gradient_clip_val=self.grad_clip_val,
+                gradient_clip_algorithm="norm",
+            )
 
         opt.step()
         opt.zero_grad()

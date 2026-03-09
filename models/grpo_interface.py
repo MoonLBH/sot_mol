@@ -63,6 +63,7 @@ class MolGen_GRPOModel(MolGen_Model):
             "ratio_max": self.ratio_max,
             "use_reference_policy": self.use_reference_policy,
             "cache_on_cpu": True,
+            "val_save_path": None,
         }
 
         if hparams is not None:
@@ -108,6 +109,15 @@ class MolGen_GRPOModel(MolGen_Model):
         max_steps=None,
         cache_on_cpu=None,
     ):
+        if not debug:
+            os.makedirs("./TensorBoard", exist_ok=True)
+            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
+            exp_dir = logger.log_dir
+        else:
+            logger = None
+            exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = os.path.join(save_path, f"{project_name}_debug_{exp_tag}")
+            
         self.data_module = MGDataModule(
             self.vocab,
             self.n_bond_types,
@@ -126,9 +136,13 @@ class MolGen_GRPOModel(MolGen_Model):
             ot_bond_weight=self.ot_bond_weight,
         )
 
+        val_save_dir = os.path.join(exp_dir, "val_samples")
+        os.makedirs(val_save_dir, exist_ok=True)
+        
         training_hparams = {
             "lr": lr,
             "warm_up_steps": warm_up_steps,
+            "val_save_path": val_save_dir,
         }
         if max_steps is not None:
             training_hparams["max_steps"] = max_steps
@@ -139,14 +153,6 @@ class MolGen_GRPOModel(MolGen_Model):
             load_ckpt=load_ckpt,
         )
 
-        if not debug:
-            os.makedirs("./TensorBoard", exist_ok=True)
-            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
-            exp_dir = logger.log_dir
-        else:
-            logger = None
-            exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-            exp_dir = os.path.join(save_path, f"{project_name}_debug_{exp_tag}")
 
         # Keep checkpoints under the same experiment directory as tensorboard logs
         # to avoid cross-run mixing/overwriting when multiple experiments share save_path.
@@ -170,7 +176,7 @@ class MolGen_GRPOModel(MolGen_Model):
             logger=logger,
             log_every_n_steps=log_steps,
             accumulate_grad_batches=acc_batches,
-            gradient_clip_val=gradient_clip_val,
+            # gradient_clip_val=gradient_clip_val,
             callbacks=[lr_monitor, checkpointing],
             precision="32",
             strategy="ddp_find_unused_parameters_true",

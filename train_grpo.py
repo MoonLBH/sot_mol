@@ -4,6 +4,7 @@ import os
 
 import lightning as L
 import torch
+from datetime import datetime
 
 from sot_mol.comparm import GP, Update_PARAMS
 from sot_mol.models.grpo_interface import MolGen_GRPOModel
@@ -19,7 +20,7 @@ if not config_path.is_absolute():
     config_path = script_dir / config_path
 
 GP = Update_PARAMS(GP, str(config_path))
-
+    
 os.environ["CUDA_VISIBLE_DEVICES"] = GP.CUDA_VISIBLE_DEVICES
 torch.set_float32_matmul_precision("high")
 L.seed_everything(12345)
@@ -54,16 +55,17 @@ model.Train(
     train_datafile=datasets_dir / "train.smol",
     val_datafile=datasets_dir / "val.smol",
     test_datafile=datasets_dir / "test.smol",
-    epochs=1,
+    epochs=100,
     save_path=str(script_dir / "models"),
     project_name="SOTMOL_GRPO_QED_TEST",
     load_ckpt=str(prior_ckpt),
     lr=GP.LR,
     debug=False,
-    ngpus=1,
-    batchsize=4,
+    ngpus=4,
+    batchsize=64,
     mini_batchsize=1,
-    max_steps=16,
+    max_steps=32,
     cache_on_cpu=True,
     log_steps=1,
+    exp_tag='version_4',
 )

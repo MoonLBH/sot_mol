@@ -150,7 +150,7 @@ class MolGen_GRPOModel(MolGen_Model):
 
         checkpointing = ModelCheckpoint(
             dirpath=save_path,
-            save_top_k=3,
+            save_top_k=5,
             every_n_epochs=1,
             monitor="train-grpo-reward-mean",
             mode="max",

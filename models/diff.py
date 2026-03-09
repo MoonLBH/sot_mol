@@ -157,6 +157,10 @@ class SC_Lightning(L.LightningModule):
 
             if "coords" in key or "atomics" in key or "charges" in key:
                 value = value [:,:max_atoms_in_batch,:]
+            elif key == "coms":
+                # dataloader 如果给的是 [B, N, 3]，压成 [B, 3]
+                if value.dim() == 3:
+                    value = value[:, 0, :]
             elif "masks" in key :
                 value = value[:,:max_atoms_in_batch]
             elif "bonds" in key:

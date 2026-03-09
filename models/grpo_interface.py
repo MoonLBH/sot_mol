@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -141,15 +142,20 @@ class MolGen_GRPOModel(MolGen_Model):
         if not debug:
             os.makedirs("./TensorBoard", exist_ok=True)
             logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
+            exp_dir = logger.log_dir
         else:
             logger = None
+            exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = os.path.join(save_path, f"{project_name}_debug_{exp_tag}")
+
+        # Keep checkpoints under the same experiment directory as tensorboard logs
+        # to avoid cross-run mixing/overwriting when multiple experiments share save_path.
+        ckpt_dir = os.path.join(exp_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
 
         lr_monitor = LearningRateMonitor(logging_interval="step")
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-
         checkpointing = ModelCheckpoint(
-            dirpath=save_path,
+            dirpath=ckpt_dir,
             save_top_k=5,
             every_n_epochs=1,
             monitor="train-grpo-reward-mean",

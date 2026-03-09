@@ -542,8 +542,14 @@ class SC_Lightning(L.LightningModule):
         else:
             predicted["coords"] = curr["coords"] * self.coord_scale
 
+        # if coms is not None:
+        #     predicted["coords"] = predicted["coords"] + coms 
         if coms is not None:
-            predicted["coords"] = predicted["coords"] + coms 
+            if coms.dim() == 2:
+                coms = coms.unsqueeze(1)
+            elif coms.dim() == 3 and coms.size(1) != 1:
+                coms = coms[:, :1, :]
+            predicted["coords"] = predicted["coords"] + coms
 
         return predicted
 

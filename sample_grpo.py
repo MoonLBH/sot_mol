@@ -13,11 +13,11 @@ parser = arg.ArgumentParser(description="Sample molecules from a GRPO checkpoint
 parser.add_argument("--config", type=str, default="rl.json")
 parser.add_argument("--ckpt", type=str, required=True)
 parser.add_argument("--test_datafile", type=str, default="")
-parser.add_argument("--save_path", type=str, default="./samples_grpo")
+parser.add_argument("--save_path", type=str, default="/data/bhli/Project/Mol-RL/test")
 parser.add_argument("--max_steps", type=int, default=32)
-parser.add_argument("--n_samples", type=int, default=1000)
+parser.add_argument("--n_samples", type=int, default=500)
 parser.add_argument("--n_replicates", type=int, default=1)
-parser.add_argument("--batchsize", type=int, default=4)
+parser.add_argument("--batchsize", type=int, default=100)
 args = parser.parse_args()
 
 script_dir = Path(__file__).resolve().parent

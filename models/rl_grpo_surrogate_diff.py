@@ -12,6 +12,11 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
       - "single_time_surrogate": one sampled time per batch element.
       - "multi_time_surrogate": multiple sampled times per batch element, averaged.
       - "trajectory_surrogate": fixed trajectory-like time grid, averaged.
+
+    For each generated batch, old surrogate losses are cached once and the model is
+    updated for K inner iterations using ratio-style weighting:
+      ratio = exp(l_old - l_new)
+      objective ~ E[ratio * advantage]
     """
 
     def __init__(
@@ -42,6 +47,9 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         adv_clip: float = 5.0,
         multi_time_samples: int = 4,
         trajectory_steps: int = 8,
+        k_updates: int = 4,
+        ratio_max: float = 20.0,
+        grad_clip_val: Optional[float] = 1.0,
     ):
         super().__init__(
             gen=gen,
@@ -76,6 +84,11 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         self.adv_clip = adv_clip
         self.multi_time_samples = max(1, int(multi_time_samples))
         self.trajectory_steps = max(2, int(trajectory_steps))
+        self.k_updates = max(1, int(k_updates))
+        self.ratio_max = ratio_max
+        self.grad_clip_val = grad_clip_val
+
+        self.automatic_optimization = False
 
     def _standardized_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         centered = rewards - rewards.mean()
@@ -155,55 +168,36 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
 
         return losses, anchor_loss
 
-    def _aggregate_per_sample_losses(self, train_batch, flag_3Ds):
-        batchsize = train_batch["natoms"].size(0)
-        device = train_batch["real_coords"].device
-
+    def _build_time_grid(self, batchsize, device):
         if self.surrogate_mode == "single_time_surrogate":
-            t = self.time_dist.sample((batchsize,)).to(device)
-            losses, anchor = self._loss_components_at_t(train_batch, t, flag_3Ds)
-            return losses, anchor
-
+            return [self.time_dist.sample((batchsize,)).to(device)]
         if self.surrogate_mode == "multi_time_surrogate":
-            acc_losses = None
-            acc_anchor = 0.0
-            for _ in range(self.multi_time_samples):
-                t = self.time_dist.sample((batchsize,)).to(device)
-                losses, anchor = self._loss_components_at_t(train_batch, t, flag_3Ds)
-                if acc_losses is None:
-                    acc_losses = {k: v.clone() for k, v in losses.items()}
-                else:
-                    for k in acc_losses:
-                        acc_losses[k] = acc_losses[k] + losses[k]
-                acc_anchor = acc_anchor + anchor
-
-            for k in acc_losses:
-                acc_losses[k] = acc_losses[k] / self.multi_time_samples
-            acc_anchor = acc_anchor / self.multi_time_samples
-            return acc_losses, acc_anchor
-
-        # trajectory_surrogate: average over fixed monotonic time grid
+            return [self.time_dist.sample((batchsize,)).to(device) for _ in range(self.multi_time_samples)]
         grid = torch.linspace(0.0, 1.0, self.trajectory_steps + 2, device=device)[1:-1]
+        return [torch.full((batchsize,), t.item(), device=device) for t in grid]
+
+    def _aggregate_per_sample_losses(self, train_batch, flag_3Ds, t_list):
         acc_losses = None
         acc_anchor = 0.0
-        for t_scalar in grid:
-            t = torch.full((batchsize,), t_scalar.item(), device=device)
+
+        for t in t_list:
             losses, anchor = self._loss_components_at_t(train_batch, t, flag_3Ds)
             if acc_losses is None:
-                acc_losses = {k: v.clone() for k, v in losses.items()}
+                acc_losses = {k: v for k, v in losses.items()}
             else:
                 for k in acc_losses:
                     acc_losses[k] = acc_losses[k] + losses[k]
             acc_anchor = acc_anchor + anchor
 
-        denom = grid.numel()
+        denom = max(len(t_list), 1)
         for k in acc_losses:
             acc_losses[k] = acc_losses[k] / denom
         acc_anchor = acc_anchor / denom
         return acc_losses, acc_anchor
 
-    def _surrogate_weighted_mean(self, per_sample_loss: torch.Tensor, advantages: torch.Tensor):
-        return (advantages.detach() * per_sample_loss).mean()
+    def _ratio_objective(self, l_old, l_new, advantages):
+        ratio = torch.exp((l_old - l_new).clamp(max=torch.log(torch.tensor(self.ratio_max, device=l_new.device, dtype=l_new.dtype))))
+        return -(ratio * advantages).mean(), ratio.mean().detach()
 
     def FM_training_step(self, batch):
         noise = self._build_noise_batch(batch)
@@ -225,19 +219,55 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         advantages = self._standardized_advantages(rewards)
         train_batch = self._build_generated_target_batch(batch, generated)
         flag_3Ds = train_batch["flag_3Ds"]
+        batchsize = train_batch["natoms"].size(0)
+        device = train_batch["real_coords"].device
 
-        losses, anchor_per_sample = self._aggregate_per_sample_losses(train_batch, flag_3Ds)
+        t_list = self._build_time_grid(batchsize, device)
 
-        coord_surr = self._surrogate_weighted_mean(losses["coord-loss"], advantages)
-        type_surr = self._surrogate_weighted_mean(losses["type-loss"], advantages)
-        bond_surr = self._surrogate_weighted_mean(losses["bond-loss"], advantages)
-        charge_surr = self._surrogate_weighted_mean(losses["charge-loss"], advantages)
-        fm_loss = coord_surr + type_surr + bond_surr + charge_surr
+        with torch.no_grad():
+            old_losses, _ = self._aggregate_per_sample_losses(train_batch, flag_3Ds, t_list)
+            old_losses = {k: v.detach() for k, v in old_losses.items()}
 
-        anchor_loss = anchor_per_sample.mean()
-        total_loss = fm_loss + (self.anchor_weight * self.anchor_loss_weight) * anchor_loss
+        opt = self.optimizers()
 
-        raw_losses = {name: loss_vals.mean() for name, loss_vals in losses.items()}
+        final_total_loss = None
+        final_fm_loss = None
+        final_anchor_loss = None
+        ratio_means = {}
+
+        for _ in range(self.k_updates):
+            opt.zero_grad()
+
+            new_losses, anchor_per_sample = self._aggregate_per_sample_losses(train_batch, flag_3Ds, t_list)
+
+            coord_obj, r_coord = self._ratio_objective(old_losses["coord-loss"], new_losses["coord-loss"], advantages)
+            type_obj, r_type = self._ratio_objective(old_losses["type-loss"], new_losses["type-loss"], advantages)
+            bond_obj, r_bond = self._ratio_objective(old_losses["bond-loss"], new_losses["bond-loss"], advantages)
+            charge_obj, r_charge = self._ratio_objective(old_losses["charge-loss"], new_losses["charge-loss"], advantages)
+
+            fm_loss = coord_obj + type_obj + bond_obj + charge_obj
+            anchor_loss = anchor_per_sample.mean()
+            total_loss = fm_loss + (self.anchor_weight * self.anchor_loss_weight) * anchor_loss
+
+            self.manual_backward(total_loss)
+            if self.grad_clip_val is not None and self.grad_clip_val > 0:
+                self.clip_gradients(
+                    opt,
+                    gradient_clip_val=self.grad_clip_val,
+                    gradient_clip_algorithm="norm",
+                )
+            opt.step()
+
+            final_total_loss = total_loss.detach()
+            final_fm_loss = fm_loss.detach()
+            final_anchor_loss = anchor_loss.detach()
+            ratio_means = {
+                "coord": r_coord,
+                "type": r_type,
+                "bond": r_bond,
+                "charge": r_charge,
+            }
+
         mode_index = {
             "single_time_surrogate": 0,
             "multi_time_surrogate": 1,
@@ -245,29 +275,23 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         }[self.surrogate_mode]
 
         self.log("train-rl-surrogate-mode", float(mode_index), on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-k-updates", float(self.k_updates), on_step=True, logger=True, sync_dist=True)
         self.log("train-rl-adv-mean", advantages.mean(), on_step=True, logger=True, sync_dist=True)
         self.log("train-rl-adv-std", advantages.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-weight-mean", advantages.mean(), on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-weight-max", advantages.max(), on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-weight-min", advantages.min(), on_step=True, logger=True, sync_dist=True)
-
-        self.log("train-fm-coord-loss", coord_surr, on_step=True, logger=True, sync_dist=True)
-        self.log("train-fm-type-loss", type_surr, on_step=True, logger=True, sync_dist=True)
-        self.log("train-fm-bond-loss", bond_surr, on_step=True, logger=True, sync_dist=True)
-        self.log("train-fm-charge-loss", charge_surr, on_step=True, logger=True, sync_dist=True)
-
-        for name, loss_val in raw_losses.items():
-            self.log(f"train-fm-raw-{name}", loss_val, on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-ratio-coord", ratio_means.get("coord", torch.tensor(0.0, device=device)), on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-ratio-type", ratio_means.get("type", torch.tensor(0.0, device=device)), on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-ratio-bond", ratio_means.get("bond", torch.tensor(0.0, device=device)), on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-ratio-charge", ratio_means.get("charge", torch.tensor(0.0, device=device)), on_step=True, logger=True, sync_dist=True)
 
         self.log("train-rl-reward-mean", rewards.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-rl-reward-max", rewards.max(), on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-anchor-loss", anchor_loss, on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-fm-loss", fm_loss, on_step=True, logger=True, sync_dist=True)
-        self.log("train-rl-total-loss", total_loss, on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-anchor-loss", final_anchor_loss, on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-fm-loss", final_fm_loss, on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-total-loss", final_total_loss, on_step=True, logger=True, sync_dist=True)
         self.log("train-gen-validity", quality_metrics["validity"], on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-gen-uniqueness", quality_metrics["uniqueness"], on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-gen-connected-validity", quality_metrics["connected-validity"], on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-gen-n-valid", quality_metrics["n-valid"], on_step=True, logger=True, sync_dist=True)
         self.log("train-gen-n-total", quality_metrics["n-total"], on_step=True, logger=True, sync_dist=True)
 
-        return total_loss
+        return final_total_loss

@@ -27,6 +27,9 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
         adv_clip=5.0,
         multi_time_samples=4,
         trajectory_steps=8,
+        k_updates=4,
+        ratio_max=20.0,
+        grad_clip_val=1.0,
         **kwargs,
     ):
         super().__init__(
@@ -48,6 +51,9 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
         self.adv_clip = adv_clip
         self.multi_time_samples = multi_time_samples
         self.trajectory_steps = trajectory_steps
+        self.k_updates = k_updates
+        self.ratio_max = ratio_max
+        self.grad_clip_val = grad_clip_val
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -73,6 +79,9 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
             "adv_clip": self.adv_clip,
             "multi_time_samples": self.multi_time_samples,
             "trajectory_steps": self.trajectory_steps,
+            "k_updates": self.k_updates,
+            "ratio_max": self.ratio_max,
+            "grad_clip_val": self.grad_clip_val,
         }
 
         if hparams is not None:

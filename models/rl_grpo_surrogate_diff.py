@@ -43,6 +43,17 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         anchor_weight: float = 0.1,
         anchor_loss_weight: float = 1.0,
         use_reference_anchor: bool = True,
+        dynamic_anchor: bool = True,
+        target_anchor_loss: float = 0.05,
+        anchor_update_rate_up: float = 1.05,
+        anchor_update_rate_down: float = 0.98,
+        anchor_weight_min: float = 1e-4,
+        anchor_weight_max: float = 10.0,
+        anchor_warmup_steps: int = 100,
+        anchor_ema_momentum: float = 0.95,
+        use_ema_reference: bool = True,
+        ema_reference_decay: float = 0.995,
+        ema_reference_update_every: int = 1,
         surrogate_mode: str = "single_time_surrogate",
         adv_clip: float = 5.0,
         multi_time_samples: int = 4,
@@ -85,8 +96,57 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         self.k_updates = max(1, int(k_updates))
         self.clip_eps = clip_eps
         self.grad_clip_val = grad_clip_val
+        self.dynamic_anchor = dynamic_anchor
+        self.target_anchor_loss = target_anchor_loss
+        self.anchor_update_rate_up = anchor_update_rate_up
+        self.anchor_update_rate_down = anchor_update_rate_down
+        self.anchor_weight_min = anchor_weight_min
+        self.anchor_weight_max = anchor_weight_max
+        self.anchor_warmup_steps = anchor_warmup_steps
+        self.anchor_ema_momentum = anchor_ema_momentum
+        self.use_ema_reference = use_ema_reference
+        self.ema_reference_decay = ema_reference_decay
+        self.ema_reference_update_every = max(1, int(ema_reference_update_every))
+        self.anchor_loss_ema = None
+        self.rl_inner_step = 0
 
         self.automatic_optimization = False
+
+    def _update_anchor_weight(self, anchor_loss: torch.Tensor):
+        if not self.dynamic_anchor:
+            return
+        if self.global_step < self.anchor_warmup_steps:
+            return
+
+        anchor_val = float(anchor_loss.detach().item())
+        if self.anchor_loss_ema is None:
+            self.anchor_loss_ema = anchor_val
+        else:
+            m = self.anchor_ema_momentum
+            self.anchor_loss_ema = m * self.anchor_loss_ema + (1 - m) * anchor_val
+
+        if self.anchor_loss_ema > self.target_anchor_loss * 1.5:
+            self.anchor_weight *= self.anchor_update_rate_up
+        elif self.anchor_loss_ema < self.target_anchor_loss * 0.5:
+            self.anchor_weight *= self.anchor_update_rate_down
+
+        self.anchor_weight = max(self.anchor_weight_min, min(self.anchor_weight, self.anchor_weight_max))
+
+    @torch.no_grad()
+    def _update_ema_reference(self):
+        if not self.use_reference_anchor:
+            return
+        if self.ref_gen is None:
+            return
+        if not self.use_ema_reference:
+            return
+
+        decay = self.ema_reference_decay
+        for ref_param, param in zip(self.ref_gen.parameters(), self.gen.parameters()):
+            ref_param.data.mul_(decay).add_(param.data, alpha=1.0 - decay)
+
+        for ref_buf, buf in zip(self.ref_gen.buffers(), self.gen.buffers()):
+            ref_buf.data.copy_(buf.data)
 
     def _standardized_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
         centered = rewards - rewards.mean()
@@ -257,9 +317,19 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
                 )
             opt.step()
 
+            self.rl_inner_step += 1
+            if (
+                self.use_reference_anchor
+                and self.use_ema_reference
+                and self.rl_inner_step % self.ema_reference_update_every == 0
+            ):
+                self._update_ema_reference()
+
             final_total_loss = total_loss.detach()
             final_fm_loss = fm_loss.detach()
             final_anchor_loss = anchor_loss.detach()
+
+        self._update_anchor_weight(final_anchor_loss)
 
         mode_index = {
             "single_time_surrogate": 0,
@@ -270,6 +340,10 @@ class RL_GRPO_Surrogate_Lightning(RL_Lightning):
         self.log("train-rl-adv-mean", advantages.mean(), on_step=True, logger=True, sync_dist=True)
         self.log("train-rl-adv-std", advantages.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
         self.log("train-rl-ratio", r_loss, on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-anchor-weight", float(self.anchor_weight), on_step=True, logger=True, sync_dist=True)
+        if self.anchor_loss_ema is not None:
+            self.log("train-rl-anchor-loss-ema", float(self.anchor_loss_ema), on_step=True, logger=True, sync_dist=True)
+        self.log("train-rl-ema-ref-decay", float(self.ema_reference_decay), on_step=True, logger=True, sync_dist=True)
 
         self.log("train-rl-reward-mean", rewards.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-rl-reward-max", rewards.max(), on_step=True, logger=True, sync_dist=True)

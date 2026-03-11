@@ -7,7 +7,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from ..data.datamodule import MGDataModule
 from .interface import MolGen_Model
 from .rl_grpo_surrogate_diff import RL_GRPO_Surrogate_Lightning
-
+from datetime import datetime
 
 class MolGen_RLGRPOSurrogateModel(MolGen_Model):
     def __init__(
@@ -26,9 +26,8 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
         surrogate_mode="single_time_surrogate",
         adv_clip=5.0,
         multi_time_samples=4,
-        trajectory_steps=8,
         k_updates=4,
-        ratio_max=20.0,
+        clip_eps=0.2,
         grad_clip_val=1.0,
         **kwargs,
     ):
@@ -50,9 +49,8 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
         self.surrogate_mode = surrogate_mode
         self.adv_clip = adv_clip
         self.multi_time_samples = multi_time_samples
-        self.trajectory_steps = trajectory_steps
         self.k_updates = k_updates
-        self.ratio_max = ratio_max
+        self.clip_eps = clip_eps
         self.grad_clip_val = grad_clip_val
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
@@ -78,9 +76,8 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
             "surrogate_mode": self.surrogate_mode,
             "adv_clip": self.adv_clip,
             "multi_time_samples": self.multi_time_samples,
-            "trajectory_steps": self.trajectory_steps,
             "k_updates": self.k_updates,
-            "ratio_max": self.ratio_max,
+            "clip_eps": self.clip_eps,
             "grad_clip_val": self.grad_clip_val,
         }
 
@@ -112,17 +109,31 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
         test_datafile,
         epochs,
         save_path="./models",
-        project_name="SOTMOL_RL_GRPO_SURROGATE",
+        project_name="SOTMOL_GRPO",
         load_ckpt=None,
         lr=1e-4,
         warm_up_steps=10000,
         acc_batches=1,
         log_steps=1,
+        val_check_epochs=1,
         debug=False,
         gradient_clip_val=1.0,
         ngpus=1,
         batchsize=16,
+        mini_batchsize=4,
+        max_steps=None,
+        exp_tag=None,
     ):
+        if not debug:
+            os.makedirs("./TensorBoard", exist_ok=True)
+            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=exp_tag)
+            exp_dir = logger.log_dir
+        else:
+            logger = None
+            if exp_tag is None:
+                exp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+            exp_dir = os.path.join(save_path, f"{project_name}_debug_{exp_tag}")
+            
         self.data_module = MGDataModule(
             self.vocab,
             self.n_bond_types,
@@ -134,36 +145,40 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
             scale_ot=self.scale_ot,
             scale_ot_factor=0.2,
             batchsize=batchsize,
-            mini_batchsize=4,
+            mini_batchsize=mini_batchsize,
             with_Hs=self.with_Hs,
             ot_geo_weight=self.ot_geo_weight,
             ot_type_weight=self.ot_type_weight,
             ot_bond_weight=self.ot_bond_weight,
         )
 
+        val_save_dir = os.path.join(exp_dir, "val_samples")
+        os.makedirs(val_save_dir, exist_ok=True)
+        
         training_hparams = {
             "lr": lr,
             "warm_up_steps": warm_up_steps,
+            "val_save_path": val_save_dir,
         }
+        if max_steps is not None:
+            training_hparams["max_steps"] = max_steps
         self.lightning_module = self.create_lightning_module(
             hparams=training_hparams,
             load_ckpt=load_ckpt,
         )
 
-        if not debug:
-            os.makedirs("./TensorBoard", exist_ok=True)
-            logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
-        else:
-            logger = None
+
+        # Keep checkpoints under the same experiment directory as tensorboard logs
+        # to avoid cross-run mixing/overwriting when multiple experiments share save_path.
+        ckpt_dir = os.path.join(exp_dir, "checkpoints")
+        os.makedirs(ckpt_dir, exist_ok=True)
 
         lr_monitor = LearningRateMonitor(logging_interval="step")
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-
         checkpointing = ModelCheckpoint(
-            dirpath=save_path,
-            save_top_k=3,
-            every_n_epochs=1,
+            dirpath=ckpt_dir,
+            save_top_k=5,
+            # every_n_epochs=1,
+            every_n_train_steps=100,   # 例子：每1000个global step检查一次
             monitor="train-rl-reward-mean",
             mode="max",
             save_last=True,
@@ -176,7 +191,7 @@ class MolGen_RLGRPOSurrogateModel(MolGen_Model):
             logger=logger,
             log_every_n_steps=log_steps,
             accumulate_grad_batches=acc_batches,
-            gradient_clip_val=gradient_clip_val,
+            # gradient_clip_val=gradient_clip_val,
             callbacks=[lr_monitor, checkpointing],
             precision="32",
             strategy="ddp_find_unused_parameters_true",

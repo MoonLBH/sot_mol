@@ -16,13 +16,13 @@ class MolGen_RLModel(MolGen_Model):
         n_bond_types,
         coord_std,
         reward_name="qed",
-        group_size=4,
-        rollout_batch_size=64,
-        rollout_buffer_size=4096,
-        beta=1.0,
-        eta_max=0.5,
-        eta_scale=1e-3,
+        reward_beta=2.0,
+        reward_weight_min=0.1,
+        reward_weight_max=10.0,
         reward_norm_eps=1e-6,
+        anchor_weight=0.1,
+        anchor_loss_weight=1.0,
+        use_reference_anchor=True,
         **kwargs,
     ):
         super().__init__(
@@ -33,13 +33,13 @@ class MolGen_RLModel(MolGen_Model):
         )
 
         self.reward_name = reward_name
-        self.group_size = group_size
-        self.rollout_batch_size = rollout_batch_size
-        self.rollout_buffer_size = rollout_buffer_size
-        self.beta = beta
-        self.eta_max = eta_max
-        self.eta_scale = eta_scale
+        self.reward_beta = reward_beta
+        self.reward_weight_min = reward_weight_min
+        self.reward_weight_max = reward_weight_max
         self.reward_norm_eps = reward_norm_eps
+        self.anchor_weight = anchor_weight
+        self.anchor_loss_weight = anchor_loss_weight
+        self.use_reference_anchor = use_reference_anchor
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -54,13 +54,13 @@ class MolGen_RLModel(MolGen_Model):
             "formulation": self.formulation,
             "eval_3D_props": self.eval_3D_props,
             "reward_name": self.reward_name,
-            "group_size": self.group_size,
-            "rollout_batch_size": self.rollout_batch_size,
-            "rollout_buffer_size": self.rollout_buffer_size,
-            "beta": self.beta,
-            "eta_max": self.eta_max,
-            "eta_scale": self.eta_scale,
+            "reward_beta": self.reward_beta,
+            "reward_weight_min": self.reward_weight_min,
+            "reward_weight_max": self.reward_weight_max,
             "reward_norm_eps": self.reward_norm_eps,
+            "anchor_weight": self.anchor_weight,
+            "anchor_loss_weight": self.anchor_loss_weight,
+            "use_reference_anchor": self.use_reference_anchor,
         }
 
         if hparams is not None:
@@ -114,7 +114,7 @@ class MolGen_RLModel(MolGen_Model):
             scale_ot=self.scale_ot,
             scale_ot_factor=0.2,
             batchsize=batchsize,
-            mini_batchsize=4,
+            mini_batchsize=1,
             with_Hs=self.with_Hs,
             ot_geo_weight=self.ot_geo_weight,
             ot_type_weight=self.ot_type_weight,

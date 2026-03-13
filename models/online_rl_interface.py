@@ -3,13 +3,13 @@ import os
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+
 from ..data.datamodule import MGDataModule
-
 from .interface import MolGen_Model
-from .rl_diff import RL_Lightning
+from .online_rl_diff import OnlineRL_Lightning
 
 
-class MolGen_RLModel(MolGen_Model):
+class MolGen_OnlineRLModel(MolGen_Model):
     def __init__(
         self,
         atom_tokens,
@@ -17,12 +17,11 @@ class MolGen_RLModel(MolGen_Model):
         coord_std,
         reward_name="qed",
         group_size=4,
-        rollout_batch_size=64,
         rollout_buffer_size=4096,
+        replay_batch_size=64,
         beta=1.0,
         eta_max=0.5,
         eta_scale=1e-3,
-        reward_norm_eps=1e-6,
         **kwargs,
     ):
         super().__init__(
@@ -34,12 +33,11 @@ class MolGen_RLModel(MolGen_Model):
 
         self.reward_name = reward_name
         self.group_size = group_size
-        self.rollout_batch_size = rollout_batch_size
         self.rollout_buffer_size = rollout_buffer_size
+        self.replay_batch_size = replay_batch_size
         self.beta = beta
         self.eta_max = eta_max
         self.eta_scale = eta_scale
-        self.reward_norm_eps = reward_norm_eps
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -55,19 +53,18 @@ class MolGen_RLModel(MolGen_Model):
             "eval_3D_props": self.eval_3D_props,
             "reward_name": self.reward_name,
             "group_size": self.group_size,
-            "rollout_batch_size": self.rollout_batch_size,
             "rollout_buffer_size": self.rollout_buffer_size,
+            "replay_batch_size": self.replay_batch_size,
             "beta": self.beta,
             "eta_max": self.eta_max,
             "eta_scale": self.eta_scale,
-            "reward_norm_eps": self.reward_norm_eps,
         }
 
         if hparams is not None:
             default_hparams.update(hparams)
 
         if load_ckpt is not None:
-            lightning_module = RL_Lightning.load_from_checkpoint(
+            lightning_module = OnlineRL_Lightning.load_from_checkpoint(
                 load_ckpt,
                 gen=self.network,
                 vocab=self.vocab,
@@ -76,7 +73,7 @@ class MolGen_RLModel(MolGen_Model):
                 **default_hparams,
             )
         else:
-            lightning_module = RL_Lightning(
+            lightning_module = OnlineRL_Lightning(
                 gen=self.network,
                 vocab=self.vocab,
                 **default_hparams,
@@ -91,13 +88,12 @@ class MolGen_RLModel(MolGen_Model):
         test_datafile,
         epochs,
         save_path="./models",
-        project_name="SOTMOL",
+        project_name="SOTMOL_ONLINE_RL",
         load_ckpt=None,
         lr=1e-4,
         warm_up_steps=10000,
         acc_batches=1,
         log_steps=1,
-        val_check_epochs=1,
         debug=False,
         gradient_clip_val=1.0,
         ngpus=1,
@@ -121,32 +117,28 @@ class MolGen_RLModel(MolGen_Model):
             ot_bond_weight=self.ot_bond_weight,
         )
 
-        training_hparams = {
-            "lr": lr,
-            "warm_up_steps": warm_up_steps,
-        }
+        training_hparams = {"lr": lr, "warm_up_steps": warm_up_steps}
         self.lightning_module = self.create_lightning_module(
             hparams=training_hparams,
             load_ckpt=load_ckpt,
         )
 
+        logger = None
         if not debug:
             os.makedirs("./TensorBoard", exist_ok=True)
             logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
-        else:
-            logger = None
 
-        lr_monitor = LearningRateMonitor(logging_interval="step")
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-
-        checkpointing = ModelCheckpoint(
-            dirpath=save_path,
-            save_top_k=3,
-            every_n_epochs=1,
-            monitor="train-rl-reward-mean",
-            mode="max",
-            save_last=True,
+        callbacks = [LearningRateMonitor(logging_interval="step")]
+        os.makedirs(save_path, exist_ok=True)
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=save_path,
+                save_top_k=3,
+                every_n_epochs=1,
+                monitor="train-online-rl-reward-mean",
+                mode="max",
+                save_last=True,
+            )
         )
 
         trainer = L.Trainer(
@@ -157,7 +149,7 @@ class MolGen_RLModel(MolGen_Model):
             log_every_n_steps=log_steps,
             accumulate_grad_batches=acc_batches,
             gradient_clip_val=gradient_clip_val,
-            callbacks=[lr_monitor, checkpointing],
+            callbacks=callbacks,
             precision="32",
             strategy="ddp_find_unused_parameters_true",
             limit_val_batches=0,

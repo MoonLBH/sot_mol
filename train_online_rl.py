@@ -6,14 +6,14 @@ import lightning as L
 import torch
 
 from sot_mol.comparm import GP, Update_PARAMS
-from sot_mol.models.rl_interface import MolGen_RLModel
+from sot_mol.models.online_rl_interface import MolGen_OnlineRLModel
 
 
-parser = arg.ArgumentParser(description="Online Finetuning trainer quick test")
+parser = arg.ArgumentParser(description="Online Finetuning Trainer (separate entry)")
 parser.add_argument("--config", type=str, default="rl.json")
 parser.add_argument("--beta", type=float, default=1.0)
 parser.add_argument("--group_size", type=int, default=4)
-parser.add_argument("--rollout_batch_size", type=int, default=64)
+parser.add_argument("--replay_batch_size", type=int, default=64)
 parser.add_argument("--rollout_buffer_size", type=int, default=4096)
 parser.add_argument("--eta_max", type=float, default=0.5)
 parser.add_argument("--eta_scale", type=float, default=1e-3)
@@ -33,7 +33,7 @@ L.seed_everything(12345)
 import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
-model = MolGen_RLModel(
+model = MolGen_OnlineRLModel(
     d_model=GP.D_MODEL,
     atom_tokens=GP.TOKENS,
     n_bond_types=GP.N_BOND_TYPES,
@@ -46,7 +46,7 @@ model = MolGen_RLModel(
     ot_bond_weight=1,
     reward_name="qed",
     group_size=args.group_size,
-    rollout_batch_size=args.rollout_batch_size,
+    replay_batch_size=args.replay_batch_size,
     rollout_buffer_size=args.rollout_buffer_size,
     beta=args.beta,
     eta_max=args.eta_max,
@@ -62,7 +62,7 @@ model.Train(
     test_datafile=datasets_dir / "test.smol",
     epochs=1,
     save_path=str(script_dir / "models"),
-    project_name="SOTMOL_ONLINE_FINETUNE_TEST",
+    project_name="SOTMOL_ONLINE_FINETUNE_SEPARATE",
     load_ckpt=str(prior_ckpt),
     lr=GP.LR,
     debug=False,

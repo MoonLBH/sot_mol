@@ -1,5 +1,5 @@
 import copy
-import math
+import importlib
 from typing import Optional
 
 import torch
@@ -11,17 +11,6 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from .reward_presets import get_task_preset
 from .rl_diff import RL_Lightning
 from ..util.rdkit import calc_energy, optimise_mol
-
-
-try:
-    from rdkit.Contrib.SA_Score import sascorer
-except Exception:
-    sascorer = None
-
-try:
-    from posebusters import PoseBusters
-except Exception:
-    PoseBusters = None
 
 
 class AdaptiveRL_Lightning(RL_Lightning):
@@ -117,7 +106,9 @@ class AdaptiveRL_Lightning(RL_Lightning):
         self.task_preset_name = task_preset_name
         self.property_warning_once = property_warning_once
         self._warned_messages = set()
-        self._posebusters = PoseBusters() if PoseBusters is not None else None
+        self._optional_modules = {}
+        self._posebusters = None
+        self._init_optional_modules()
         self.required_smarts = required_smarts or []
         self.forbidden_smarts = forbidden_smarts or []
         self.reward_transforms = copy.deepcopy(reward_transforms or {})
@@ -170,6 +161,28 @@ class AdaptiveRL_Lightning(RL_Lightning):
         dual_init = [float(self.constraint_specs[name].get("weight_init", 0.0)) for name in constraint_names]
         dual_tensor = torch.tensor(dual_init, dtype=torch.float32) if dual_init else torch.zeros(0, dtype=torch.float32)
         self.register_buffer("constraint_lambdas", dual_tensor)
+
+    def _init_optional_modules(self):
+        self._optional_modules["rdkit_sascorer"] = self._load_optional_module("rdkit.Contrib.SA_Score.sascorer")
+        posebusters_mod = self._load_optional_module("posebusters")
+        if posebusters_mod is not None and hasattr(posebusters_mod, "PoseBusters"):
+            try:
+                self._posebusters = posebusters_mod.PoseBusters()
+            except Exception:
+                self._warn_once("posebusters_init", "PoseBusters found but failed to initialize; disabling PoseBusters metrics.")
+                self._posebusters = None
+        else:
+            self._posebusters = None
+
+    def _load_optional_module(self, module_name):
+        if module_name in self._optional_modules:
+            return self._optional_modules[module_name]
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            module = None
+        self._optional_modules[module_name] = module
+        return module
 
     def _warn_once(self, key: str, message: str):
         if (not self.property_warning_once) or (key not in self._warned_messages):
@@ -233,8 +246,9 @@ class AdaptiveRL_Lightning(RL_Lightning):
     def _compute_sa_score(self, mol):
         if mol is None:
             return None
+        sascorer = self._optional_modules.get("rdkit_sascorer")
         if sascorer is None:
-            raise NotImplementedError("SA score requested but RDKit Contrib SA_Score.sascorer is unavailable.")
+            return None
         return float(sascorer.calculateScore(mol))
 
     def _compute_strain_per_atom(self, mol):
@@ -341,8 +355,6 @@ class AdaptiveRL_Lightning(RL_Lightning):
                     sa_val = self._compute_sa_score(mol)
                     if sa_val is not None:
                         sa_score = sa_val
-                except NotImplementedError:
-                    raise
                 except Exception:
                     sa_score = 10.0
                 if self._posebusters is not None:

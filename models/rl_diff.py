@@ -7,6 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from rdkit import Chem
 from rdkit.Chem import QED
+from ..comparm import GP
 from .diff import SC_Lightning
 
 
@@ -17,10 +18,10 @@ class MoleculeTimestepSampler(torch.nn.Module):
     and predicts Beta parameters. We keep this intentionally simple and dependency-free.
     """
 
-    def __init__(self, hidden_dim: int = 256, hidden_depth: int = 2, eps: float = 1e-4):
+    def __init__(self, input_dim: int, hidden_dim: int = 256, hidden_depth: int = 2, eps: float = 1e-4):
         super().__init__()
         self.eps = eps
-        layers = [nn.LazyLinear(hidden_dim), nn.SiLU()]
+        layers = [nn.Linear(input_dim, hidden_dim), nn.SiLU()]
         for _ in range(max(0, hidden_depth - 1)):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.SiLU()])
         self.backbone = nn.Sequential(*layers)
@@ -77,6 +78,7 @@ class RL_Lightning(SC_Lightning):
         value_use_baseline: bool = False,
         adaptive_value_include_anchor: bool = False,
         adaptive_timestep_mix_base_prob: float = 0.0,
+        timestep_sampler_feature_dim: Optional[int] = None,
     ):
         super().__init__(
             gen=gen,
@@ -122,8 +124,15 @@ class RL_Lightning(SC_Lightning):
         self.value_use_baseline = value_use_baseline
         self.adaptive_value_include_anchor = adaptive_value_include_anchor
         self.adaptive_timestep_mix_base_prob = float(adaptive_timestep_mix_base_prob)
+        self.timestep_sampler_charge_dim = len(GP.IDX_CHARGE_MAP)
+        self.timestep_sampler_feature_dim = (
+            timestep_sampler_feature_dim
+            if timestep_sampler_feature_dim is not None
+            else (1 + 3 + 3 + int(vocab.size) + self.timestep_sampler_charge_dim)
+        )
 
         self.timestep_sampler = MoleculeTimestepSampler(
+            input_dim=self.timestep_sampler_feature_dim,
             hidden_dim=self.timestep_sampler_hidden_dim,
             hidden_depth=self.timestep_sampler_hidden_depth,
             eps=self.timestep_sampler_eps,
@@ -362,6 +371,15 @@ class RL_Lightning(SC_Lightning):
         if charges is not None:
             charges_mean = (charges * mask3).sum(dim=1) / denom
             feature_chunks.append(charges_mean)
+        else:
+            feature_chunks.append(
+                torch.zeros(
+                    coords.size(0),
+                    self.timestep_sampler_charge_dim,
+                    device=coords.device,
+                    dtype=coords.dtype,
+                )
+            )
 
         features = torch.cat(feature_chunks, dim=-1)
         features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)

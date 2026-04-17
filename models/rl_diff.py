@@ -353,11 +353,17 @@ class RL_Lightning(SC_Lightning):
         coords = generated["coords"]
         atomics = generated["atomics"]
         charges = generated.get("charges")
+        batch_size = coords.size(0)
         masks = batch_or_train_batch["masks"].float()
+        if masks.dim() == 3:
+            masks = masks.squeeze(-1)
+        if masks.dim() != 2:
+            masks = masks.reshape(batch_size, -1)
         mask3 = masks.unsqueeze(-1)
         denom = masks.sum(dim=1, keepdim=True).clamp_min(1.0)
 
-        natoms = batch_or_train_batch["natoms"].float().unsqueeze(-1)
+        natoms = batch_or_train_batch["natoms"].float()
+        natoms = natoms.reshape(batch_size, -1)[:, :1]
         natoms_norm = natoms / max(float(coords.size(1)), 1.0)
 
         coords_mean = (coords * mask3).sum(dim=1) / denom
@@ -381,8 +387,22 @@ class RL_Lightning(SC_Lightning):
                 )
             )
 
-        features = torch.cat(feature_chunks, dim=-1)
+        normalized_chunks = []
+        for idx, feat in enumerate(feature_chunks):
+            feat = torch.nan_to_num(feat, nan=0.0, posinf=1.0, neginf=-1.0)
+            if feat.dim() == 1:
+                feat = feat.unsqueeze(-1)
+            elif feat.dim() > 2:
+                feat = feat.reshape(feat.size(0), -1)
+            assert feat.dim() == 2, f"timestep sampler feature[{idx}] must be 2D, got shape={tuple(feat.shape)}"
+            assert feat.size(0) == batch_size, (
+                f"timestep sampler feature[{idx}] batch mismatch: {feat.size(0)} vs {batch_size}"
+            )
+            normalized_chunks.append(feat)
+
+        features = torch.cat(normalized_chunks, dim=-1)
         features = torch.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        assert features.dim() == 2, f"timestep sampler cat features must be 2D, got shape={tuple(features.shape)}"
         return features
 
     def _sample_adaptive_t(self, batchsize, generated, batch_or_train_batch):

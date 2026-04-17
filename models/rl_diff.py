@@ -449,84 +449,87 @@ class RL_Lightning(SC_Lightning):
         use_self_cond=False,
         stochastic_self_cond=False,
         include_anchor=False,
+        requires_grad=True,
     ):
-        flag_3Ds = train_batch["flag_3Ds"]
-        interp_data = self.interpolate(train_batch, t, flag_3Ds=flag_3Ds)
+        grad_ctx = torch.enable_grad() if requires_grad else torch.no_grad()
+        with grad_ctx:
+            flag_3Ds = train_batch["flag_3Ds"]
+            interp_data = self.interpolate(train_batch, t, flag_3Ds=flag_3Ds)
 
-        cond_batch = None
-        if use_self_cond:
-            cond_batch = {
-                "coords": torch.zeros_like(interp_data["coords"]),
-                "atomics": torch.zeros_like(interp_data["atomics"]),
-                "bonds": torch.zeros_like(interp_data["bonds"]),
-            }
-            if stochastic_self_cond and torch.rand(1).item() > 0.5:
-                with torch.no_grad():
-                    cond_coords, cond_types, cond_bonds, _ = self._forward_with_model(
-                        model,
-                        interp_data,
-                        t,
-                        cond_batch=cond_batch,
-                        flag_3Ds=flag_3Ds,
-                    )
+            cond_batch = None
+            if use_self_cond:
                 cond_batch = {
-                    "coords": cond_coords * flag_3Ds.view(-1, 1, 1),
-                    "atomics": F.softmax(cond_types, dim=-1),
-                    "bonds": F.softmax(cond_bonds, dim=-1),
+                    "coords": torch.zeros_like(interp_data["coords"]),
+                    "atomics": torch.zeros_like(interp_data["atomics"]),
+                    "bonds": torch.zeros_like(interp_data["bonds"]),
                 }
+                if stochastic_self_cond and torch.rand(1).item() > 0.5:
+                    with torch.no_grad():
+                        cond_coords, cond_types, cond_bonds, _ = self._forward_with_model(
+                            model,
+                            interp_data,
+                            t,
+                            cond_batch=cond_batch,
+                            flag_3Ds=flag_3Ds,
+                        )
+                    cond_batch = {
+                        "coords": cond_coords * flag_3Ds.view(-1, 1, 1),
+                        "atomics": F.softmax(cond_types, dim=-1),
+                        "bonds": F.softmax(cond_bonds, dim=-1),
+                    }
 
-        coords, types, bonds, charges = self._forward_with_model(
-            model,
-            interp_data,
-            t,
-            cond_batch=cond_batch,
-            flag_3Ds=flag_3Ds,
-        )
-
-        predicted = {
-            "coords": coords,
-            "atomics": types,
-            "bonds": bonds,
-            "charges": charges,
-        }
-
-        if self.formulation == "endpoint":
-            coords_target = train_batch["real_coords"]
-        else:
-            coords_target = train_batch["real_coords"] - train_batch["noise_coords"]
-
-        target = {
-            "coords": coords_target,
-            "atomics": train_batch["real_atomics"],
-            "bonds": train_batch["real_bonds"],
-            "charges": train_batch["real_charges"],
-            "masks": train_batch["masks"],
-        }
-        losses = self._loss_per_sample(target, predicted, flag_3Ds=flag_3Ds)
-        per_sample_loss = (
-            losses["coord-loss"]
-            + losses["type-loss"]
-            + losses["bond-loss"]
-            + losses["charge-loss"]
-        )
-        weighted_utility = -weights * per_sample_loss
-
-        anchor_per_sample = torch.zeros_like(per_sample_loss)
-        if include_anchor:
-            anchor_losses = self._anchor_loss_per_sample(
+            coords, types, bonds, charges = self._forward_with_model(
+                model,
                 interp_data,
                 t,
-                predicted,
                 cond_batch=cond_batch,
                 flag_3Ds=flag_3Ds,
             )
-            anchor_per_sample = (
-                anchor_losses["coord"]
-                + anchor_losses["types"]
-                + anchor_losses["bonds"]
-                + anchor_losses["charges"]
+
+            predicted = {
+                "coords": coords,
+                "atomics": types,
+                "bonds": bonds,
+                "charges": charges,
+            }
+
+            if self.formulation == "endpoint":
+                coords_target = train_batch["real_coords"]
+            else:
+                coords_target = train_batch["real_coords"] - train_batch["noise_coords"]
+
+            target = {
+                "coords": coords_target,
+                "atomics": train_batch["real_atomics"],
+                "bonds": train_batch["real_bonds"],
+                "charges": train_batch["real_charges"],
+                "masks": train_batch["masks"],
+            }
+            losses = self._loss_per_sample(target, predicted, flag_3Ds=flag_3Ds)
+            per_sample_loss = (
+                losses["coord-loss"]
+                + losses["type-loss"]
+                + losses["bond-loss"]
+                + losses["charge-loss"]
             )
-            weighted_utility = weighted_utility - (self.anchor_weight * self.anchor_loss_weight) * anchor_per_sample
+            weighted_utility = -weights * per_sample_loss
+
+            anchor_per_sample = torch.zeros_like(per_sample_loss)
+            if include_anchor:
+                anchor_losses = self._anchor_loss_per_sample(
+                    interp_data,
+                    t,
+                    predicted,
+                    cond_batch=cond_batch,
+                    flag_3Ds=flag_3Ds,
+                )
+                anchor_per_sample = (
+                    anchor_losses["coord"]
+                    + anchor_losses["types"]
+                    + anchor_losses["bonds"]
+                    + anchor_losses["charges"]
+                )
+                weighted_utility = weighted_utility - (self.anchor_weight * self.anchor_loss_weight) * anchor_per_sample
 
         return {
             "losses": losses,
@@ -560,6 +563,7 @@ class RL_Lightning(SC_Lightning):
                 use_self_cond=False,
                 stochastic_self_cond=False,
                 include_anchor=include_anchor,
+                requires_grad=False,
             )
             post_out = self._compute_reward_weighted_losses_at_t(
                 self.gen,
@@ -569,6 +573,7 @@ class RL_Lightning(SC_Lightning):
                 use_self_cond=False,
                 stochastic_self_cond=False,
                 include_anchor=include_anchor,
+                requires_grad=False,
             )
             pre_util_cols.append(pre_out["weighted_utility"])
             post_util_cols.append(post_out["weighted_utility"])
@@ -753,7 +758,7 @@ class RL_Lightning(SC_Lightning):
         # ===== Algorithm 1: Main adaptive-timestep training flow =====
         opt_gen, opt_sampler = self.optimizers()
         sch_gen, sch_sampler = self.lr_schedulers()
-        opt_gen.zero_grad()
+        opt_gen.zero_grad(set_to_none=True)
 
         noise = self._build_noise_batch(batch)
         with torch.no_grad():
@@ -798,7 +803,8 @@ class RL_Lightning(SC_Lightning):
             weights,
             use_self_cond=self.self_cond,
             stochastic_self_cond=True,
-            include_anchor=False,
+            include_anchor=self.anchor_weight > 0,
+            requires_grad=True,
         )
         losses = main_out["losses"]
         weighted_losses = {name: (val * weights).mean() for name, val in losses.items()}
@@ -806,16 +812,7 @@ class RL_Lightning(SC_Lightning):
 
         anchor_loss = torch.zeros(1, device=device, dtype=dtype).squeeze(0)
         if self.anchor_weight > 0:
-            anchor_out = self._compute_reward_weighted_losses_at_t(
-                self.gen,
-                train_batch,
-                t,
-                torch.ones_like(weights),
-                use_self_cond=self.self_cond,
-                stochastic_self_cond=True,
-                include_anchor=True,
-            )
-            anchor_loss = anchor_out["anchor_per_sample"].mean()
+            anchor_loss = main_out["anchor_per_sample"].mean()
         total_loss = fm_loss + (self.anchor_weight * self.anchor_loss_weight) * anchor_loss
 
         self.manual_backward(total_loss)

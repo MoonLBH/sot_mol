@@ -23,6 +23,7 @@ class MolGen_RLModel(MolGen_Model):
         anchor_weight=0.1,
         anchor_loss_weight=1.0,
         use_reference_anchor=True,
+        adaptive_hparams=None,
         **kwargs,
     ):
         super().__init__(
@@ -40,6 +41,7 @@ class MolGen_RLModel(MolGen_Model):
         self.anchor_weight = anchor_weight
         self.anchor_loss_weight = anchor_loss_weight
         self.use_reference_anchor = use_reference_anchor
+        self.adaptive_hparams = adaptive_hparams or {}
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -62,6 +64,7 @@ class MolGen_RLModel(MolGen_Model):
             "anchor_loss_weight": self.anchor_loss_weight,
             "use_reference_anchor": self.use_reference_anchor,
         }
+        default_hparams.update(self.adaptive_hparams)
 
         if hparams is not None:
             default_hparams.update(hparams)

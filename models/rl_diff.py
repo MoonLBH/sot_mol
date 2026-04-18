@@ -1,4 +1,7 @@
 import copy
+import csv
+import json
+import os
 from collections import deque
 from typing import Optional
 
@@ -79,6 +82,16 @@ class RL_Lightning(SC_Lightning):
         adaptive_value_include_anchor: bool = False,
         adaptive_timestep_mix_base_prob: float = 0.0,
         timestep_sampler_feature_dim: Optional[int] = None,
+        fig2_profile_enabled: bool = False,
+        fig2_profile_every_updates: int = 500,
+        fig2_profile_num_bins: int = 16,
+        fig2_profile_cache_size: int = 4,
+        fig2_profile_grad_batches: int = 4,
+        fig2_profile_use_self_cond: bool = False,
+        fig2_profile_include_anchor: bool = False,
+        fig2_profile_save_dir: Optional[str] = None,
+        fig2_profile_param_mode: str = "all",
+        fig2_profile_last_k_tensors: int = 8,
     ):
         super().__init__(
             gen=gen,
@@ -141,8 +154,25 @@ class RL_Lightning(SC_Lightning):
         self.value_baseline = None
         self._adaptive_warn_flag = False
 
+        # Fig.2-style profiling configs/states (disabled by default; no impact on main training path).
+        self.fig2_profile_enabled = fig2_profile_enabled
+        self.fig2_profile_every_updates = max(1, int(fig2_profile_every_updates))
+        self.fig2_profile_num_bins = max(2, int(fig2_profile_num_bins))
+        self.fig2_profile_cache_size = max(1, int(fig2_profile_cache_size))
+        self.fig2_profile_grad_batches = max(1, int(fig2_profile_grad_batches))
+        self.fig2_profile_use_self_cond = fig2_profile_use_self_cond
+        self.fig2_profile_include_anchor = fig2_profile_include_anchor
+        self.fig2_profile_save_dir = fig2_profile_save_dir
+        self.fig2_profile_param_mode = fig2_profile_param_mode
+        self.fig2_profile_last_k_tensors = max(1, int(fig2_profile_last_k_tensors))
+        self._fig2_profile_batches = []
+        self._fig2_batch_update_idx = 0
+        self._fig2_last_profile_update = -1
+
         if self.adaptive_timestep_mode not in {"probe", "one_step_value"}:
             raise ValueError("adaptive_timestep_mode must be one of {'probe', 'one_step_value'}")
+        if self.fig2_profile_param_mode not in {"all", "last_k"}:
+            raise ValueError("fig2_profile_param_mode must be one of {'all', 'last_k'}")
 
         # Two-optimizer update requires manual optimization.
         if self.adaptive_timestep_enabled:
@@ -903,10 +933,15 @@ class RL_Lightning(SC_Lightning):
 
     def training_step(self, batch, b_idx):
         batch = self.flatten_batch(batch)
+        self._maybe_cache_fig2_profile_batch(batch)
         fm_loss = self.FM_training_step(batch)
         self.log("train-fm-loss", fm_loss, prog_bar=True, on_step=True, logger=True)
         self.log("train-loss", fm_loss, prog_bar=True, on_step=True, logger=True)
         return fm_loss
+
+    def on_train_batch_end(self, outputs, batch, b_idx):
+        super().on_train_batch_end(outputs, batch, b_idx)
+        self._maybe_run_fig2_profile_after_update()
 
     def configure_optimizers(self):
         if not self.adaptive_timestep_enabled:
@@ -947,6 +982,259 @@ class RL_Lightning(SC_Lightning):
                 "interval": "step",
             },
         ]
+
+    # ===== Fig.2 profiling helpers (additional diagnostics only; no optimizer step here) =====
+    def _detach_to_cpu(self, obj):
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().clone()
+        if isinstance(obj, dict):
+            return {k: self._detach_to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            t = [self._detach_to_cpu(v) for v in obj]
+            return type(obj)(t)
+        return obj
+
+    def _move_batch_to_device(self, obj, device):
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device=device)
+        if isinstance(obj, dict):
+            return {k: self._move_batch_to_device(v, device) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            t = [self._move_batch_to_device(v, device) for v in obj]
+            return type(obj)(t)
+        return obj
+
+    def _maybe_cache_fig2_profile_batch(self, batch):
+        if not self.fig2_profile_enabled:
+            return
+        cpu_batch = self._detach_to_cpu(batch)
+        self._fig2_profile_batches.append(cpu_batch)
+        if len(self._fig2_profile_batches) > self.fig2_profile_cache_size:
+            self._fig2_profile_batches = self._fig2_profile_batches[-self.fig2_profile_cache_size :]
+
+    def _get_fig2_tau_centers(self, device, dtype):
+        i = torch.arange(self.fig2_profile_num_bins, device=device, dtype=dtype)
+        return (i + 0.5) / float(self.fig2_profile_num_bins)
+
+    def _iter_fig2_profile_params(self):
+        params = [p for p in self.gen.parameters() if p.requires_grad]
+        if self.fig2_profile_param_mode == "last_k":
+            params = params[-self.fig2_profile_last_k_tensors :]
+        return params
+
+    def _flatten_profile_grads(self, params, grads):
+        chunks = []
+        for p, g in zip(params, grads):
+            if g is None:
+                chunks.append(torch.zeros_like(p, memory_format=torch.contiguous_format).reshape(-1))
+            else:
+                chunks.append(g.detach().reshape(-1))
+        if len(chunks) == 0:
+            return torch.zeros(1, device=self.device)
+        return torch.cat(chunks, dim=0)
+
+    def _compute_raw_fm_loss_at_fixed_t(self, train_batch, t_vec):
+        bs = train_batch["natoms"].size(0)
+        ones = torch.ones(bs, device=train_batch["real_coords"].device, dtype=train_batch["real_coords"].dtype)
+        out = self._compute_reward_weighted_losses_at_t(
+            self.gen,
+            train_batch,
+            t_vec,
+            ones,
+            use_self_cond=self.fig2_profile_use_self_cond,
+            stochastic_self_cond=False,
+            include_anchor=self.fig2_profile_include_anchor,
+            requires_grad=True,
+        )
+        return out["per_sample_loss"].mean()
+
+    def _compute_fig2_loss_curve(self, profile_batches, tau_centers, device, dtype):
+        values = []
+        for tau in tau_centers:
+            tau_loss_vals = []
+            for cached_batch in profile_batches:
+                batch_dev = self._move_batch_to_device(cached_batch, device)
+                noise = self._build_noise_batch(batch_dev)
+                with torch.no_grad():
+                    generated_pre = self._generate(
+                        noise,
+                        inference_steps=self.max_steps,
+                        coord_noise_std=self.default_coord_noise_std,
+                        cat_noise_level=self.default_cat_noise_level,
+                    )
+                    train_batch = self._build_generated_target_batch(batch_dev, generated_pre)
+                t_vec = torch.full(
+                    (train_batch["natoms"].size(0),),
+                    float(tau.item()),
+                    device=device,
+                    dtype=dtype,
+                )
+                with torch.no_grad():
+                    ones = torch.ones(t_vec.size(0), device=device, dtype=dtype)
+                    out = self._compute_reward_weighted_losses_at_t(
+                        self.gen,
+                        train_batch,
+                        t_vec,
+                        ones,
+                        use_self_cond=self.fig2_profile_use_self_cond,
+                        stochastic_self_cond=False,
+                        include_anchor=self.fig2_profile_include_anchor,
+                        requires_grad=False,
+                    )
+                    tau_loss_vals.append(out["per_sample_loss"].mean())
+            values.append(torch.stack(tau_loss_vals).mean())
+        return torch.stack(values)
+
+    def _compute_fig2_gradvar_curve(self, profile_batches, tau_centers, device, dtype):
+        grad_var_vals = []
+        params = self._iter_fig2_profile_params()
+        if len(params) == 0:
+            return torch.zeros_like(tau_centers)
+
+        use_batches = profile_batches[: self.fig2_profile_grad_batches]
+        for tau in tau_centers:
+            grad_vecs = []
+            for cached_batch in use_batches:
+                batch_dev = self._move_batch_to_device(cached_batch, device)
+                noise = self._build_noise_batch(batch_dev)
+                with torch.no_grad():
+                    generated_pre = self._generate(
+                        noise,
+                        inference_steps=self.max_steps,
+                        coord_noise_std=self.default_coord_noise_std,
+                        cat_noise_level=self.default_cat_noise_level,
+                    )
+                    train_batch = self._build_generated_target_batch(batch_dev, generated_pre)
+
+                t_vec = torch.full(
+                    (train_batch["natoms"].size(0),),
+                    float(tau.item()),
+                    device=device,
+                    dtype=dtype,
+                )
+
+                self.gen.zero_grad(set_to_none=True)
+                raw_loss = self._compute_raw_fm_loss_at_fixed_t(train_batch, t_vec)
+                grads = torch.autograd.grad(raw_loss, params, retain_graph=False, create_graph=False, allow_unused=True)
+                grad_vec = self._flatten_profile_grads(params, grads)
+                grad_vecs.append(grad_vec)
+
+            gs = torch.stack(grad_vecs, dim=0)
+            mean_sq_norm = (gs.pow(2).sum(dim=1)).mean()
+            mean_g = gs.mean(dim=0)
+            sq_norm_mean = mean_g.pow(2).sum()
+            var_hat = torch.clamp(mean_sq_norm - sq_norm_mean, min=0.0)
+            grad_var_vals.append(var_hat)
+            self.gen.zero_grad(set_to_none=True)
+
+        return torch.stack(grad_var_vals)
+
+    def _resolve_fig2_profile_save_dir(self):
+        if self.fig2_profile_save_dir is not None:
+            out_dir = self.fig2_profile_save_dir
+        else:
+            log_dir = None
+            if getattr(self, "logger", None) is not None:
+                log_dir = getattr(self.logger, "log_dir", None)
+            out_dir = os.path.join(log_dir, "fig2_profile") if log_dir is not None else os.path.join(os.getcwd(), "fig2_profile")
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
+
+    def _run_fig2_profile_snapshot(self):
+        if len(self._fig2_profile_batches) == 0:
+            self.log("train-fig2-profile-skip", torch.tensor(1.0, device=self.device), on_step=True, logger=True, sync_dist=False)
+            return
+
+        try:
+            device = self.device
+            dtype = next(self.gen.parameters()).dtype
+            tau_centers = self._get_fig2_tau_centers(device=device, dtype=dtype)
+            loss_curve = self._compute_fig2_loss_curve(self._fig2_profile_batches, tau_centers, device=device, dtype=dtype)
+            grad_var_curve = self._compute_fig2_gradvar_curve(self._fig2_profile_batches, tau_centers, device=device, dtype=dtype)
+
+            update_idx = int(self._fig2_batch_update_idx)
+            stage_idx = update_idx // self.fig2_profile_every_updates
+            out_dir = self._resolve_fig2_profile_save_dir()
+            pt_path = os.path.join(out_dir, f"stage_{stage_idx:04d}_update_{update_idx:08d}.pt")
+            payload = {
+                "stage_idx": stage_idx,
+                "update_idx": update_idx,
+                "tau_centers": tau_centers.detach().cpu(),
+                "loss_curve": loss_curve.detach().cpu(),
+                "grad_var_curve": grad_var_curve.detach().cpu(),
+                "num_bins": self.fig2_profile_num_bins,
+                "cache_size_used": len(self._fig2_profile_batches),
+                "grad_batches_used": min(self.fig2_profile_grad_batches, len(self._fig2_profile_batches)),
+            }
+            torch.save(payload, pt_path)
+
+            summary_path = os.path.join(out_dir, "summary.jsonl")
+            summary = {
+                "stage_idx": stage_idx,
+                "update_idx": update_idx,
+                "num_bins": self.fig2_profile_num_bins,
+                "cache_size_used": len(self._fig2_profile_batches),
+                "grad_batches_used": min(self.fig2_profile_grad_batches, len(self._fig2_profile_batches)),
+                "loss_mean": float(loss_curve.mean().item()),
+                "loss_max": float(loss_curve.max().item()),
+                "loss_min": float(loss_curve.min().item()),
+                "loss_spread": float((loss_curve.max() - loss_curve.min()).item()),
+                "gradvar_mean": float(grad_var_curve.mean().item()),
+                "gradvar_max": float(grad_var_curve.max().item()),
+                "gradvar_min": float(grad_var_curve.min().item()),
+                "gradvar_spread": float((grad_var_curve.max() - grad_var_curve.min()).item()),
+                "pt_path": pt_path,
+            }
+            with open(summary_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+            csv_path = os.path.join(out_dir, f"stage_{stage_idx:04d}_update_{update_idx:08d}.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["tau", "loss", "grad_var", "stage_idx", "update_idx"])
+                for tau, loss_v, var_v in zip(
+                    tau_centers.detach().cpu().tolist(),
+                    loss_curve.detach().cpu().tolist(),
+                    grad_var_curve.detach().cpu().tolist(),
+                ):
+                    writer.writerow([tau, loss_v, var_v, stage_idx, update_idx])
+
+            self.log("train-fig2-profile-stage", torch.tensor(float(stage_idx), device=device), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-profile-update", torch.tensor(float(update_idx), device=device), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-loss-curve-mean", loss_curve.mean(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-loss-curve-max", loss_curve.max(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-loss-curve-min", loss_curve.min(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-loss-spread", (loss_curve.max() - loss_curve.min()), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-gradvar-curve-mean", grad_var_curve.mean(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-gradvar-curve-max", grad_var_curve.max(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-gradvar-curve-min", grad_var_curve.min(), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-gradvar-spread", (grad_var_curve.max() - grad_var_curve.min()), on_step=True, logger=True, sync_dist=False)
+            self.log(
+                "train-fig2-profile-cache-size-used",
+                torch.tensor(float(len(self._fig2_profile_batches)), device=device),
+                on_step=True,
+                logger=True,
+                sync_dist=False,
+            )
+            self.log("train-fig2-profile-skip", torch.tensor(0.0, device=device), on_step=True, logger=True, sync_dist=False)
+        except Exception:
+            self.log("train-fig2-profile-skip", torch.tensor(1.0, device=self.device), on_step=True, logger=True, sync_dist=False)
+
+    def _maybe_run_fig2_profile_after_update(self):
+        if not self.fig2_profile_enabled:
+            return
+        self._fig2_batch_update_idx += 1
+        update_idx = self._fig2_batch_update_idx
+        if update_idx == self._fig2_last_profile_update:
+            return
+        if update_idx % self.fig2_profile_every_updates != 0:
+            return
+        self._fig2_last_profile_update = update_idx
+
+        trainer = getattr(self, "trainer", None)
+        is_global_zero = True if trainer is None else bool(getattr(trainer, "is_global_zero", True))
+        if is_global_zero:
+            self._run_fig2_profile_snapshot()
 
     def validation_step(self, batch, b_idx):
         return

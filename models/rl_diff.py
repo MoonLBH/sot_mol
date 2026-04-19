@@ -2,6 +2,7 @@ import copy
 import csv
 import json
 import os
+import traceback
 from collections import deque
 from typing import Optional
 
@@ -1143,6 +1144,7 @@ class RL_Lightning(SC_Lightning):
     def _run_fig2_profile_snapshot(self):
         if len(self._fig2_profile_batches) == 0:
             self.log("train-fig2-profile-skip", torch.tensor(1.0, device=self.device), on_step=True, logger=True, sync_dist=False)
+            self.log("train-fig2-profile-cache-size-used", torch.tensor(0.0, device=self.device), on_step=True, logger=True, sync_dist=False)
             return
 
         try:
@@ -1150,7 +1152,14 @@ class RL_Lightning(SC_Lightning):
             dtype = next(self.gen.parameters()).dtype
             tau_centers = self._get_fig2_tau_centers(device=device, dtype=dtype)
             loss_curve = self._compute_fig2_loss_curve(self._fig2_profile_batches, tau_centers, device=device, dtype=dtype)
-            grad_var_curve = self._compute_fig2_gradvar_curve(self._fig2_profile_batches, tau_centers, device=device, dtype=dtype)
+            gradvar_failed = False
+            try:
+                grad_var_curve = self._compute_fig2_gradvar_curve(self._fig2_profile_batches, tau_centers, device=device, dtype=dtype)
+            except Exception:
+                gradvar_failed = True
+                grad_var_curve = torch.zeros_like(loss_curve)
+                self.print("Warning: fig2 grad variance profiling failed, fallback to zeros.")
+                self.print(traceback.format_exc())
 
             update_idx = int(self._fig2_batch_update_idx)
             stage_idx = update_idx // self.fig2_profile_every_updates
@@ -1210,6 +1219,13 @@ class RL_Lightning(SC_Lightning):
             self.log("train-fig2-gradvar-curve-min", grad_var_curve.min(), on_step=True, logger=True, sync_dist=False)
             self.log("train-fig2-gradvar-spread", (grad_var_curve.max() - grad_var_curve.min()), on_step=True, logger=True, sync_dist=False)
             self.log(
+                "train-fig2-profile-gradvar-failed",
+                torch.tensor(1.0 if gradvar_failed else 0.0, device=device),
+                on_step=True,
+                logger=True,
+                sync_dist=False,
+            )
+            self.log(
                 "train-fig2-profile-cache-size-used",
                 torch.tensor(float(len(self._fig2_profile_batches)), device=device),
                 on_step=True,
@@ -1218,7 +1234,16 @@ class RL_Lightning(SC_Lightning):
             )
             self.log("train-fig2-profile-skip", torch.tensor(0.0, device=device), on_step=True, logger=True, sync_dist=False)
         except Exception:
+            self.print("Warning: fig2 profiling snapshot failed, skipped this stage.")
+            self.print(traceback.format_exc())
             self.log("train-fig2-profile-skip", torch.tensor(1.0, device=self.device), on_step=True, logger=True, sync_dist=False)
+            self.log(
+                "train-fig2-profile-cache-size-used",
+                torch.tensor(float(len(self._fig2_profile_batches)), device=self.device),
+                on_step=True,
+                logger=True,
+                sync_dist=False,
+            )
 
     def _maybe_run_fig2_profile_after_update(self):
         if not self.fig2_profile_enabled:

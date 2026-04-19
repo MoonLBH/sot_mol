@@ -3,13 +3,13 @@ import os
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
+
 from ..data.datamodule import MGDataModule
-
 from .interface import MolGen_Model
-from .rl_diff import RL_Lightning
+from .rl_diff_adaptive import AdaptiveRL_Lightning
 
 
-class MolGen_RLModel(MolGen_Model):
+class MolGen_AdaptiveRLModel(MolGen_Model):
     def __init__(
         self,
         atom_tokens,
@@ -65,12 +65,11 @@ class MolGen_RLModel(MolGen_Model):
             "use_reference_anchor": self.use_reference_anchor,
         }
         default_hparams.update(self.adaptive_hparams)
-
         if hparams is not None:
             default_hparams.update(hparams)
 
         if load_ckpt is not None:
-            lightning_module = RL_Lightning.load_from_checkpoint(
+            lightning_module = AdaptiveRL_Lightning.load_from_checkpoint(
                 load_ckpt,
                 gen=self.network,
                 vocab=self.vocab,
@@ -79,7 +78,7 @@ class MolGen_RLModel(MolGen_Model):
                 **default_hparams,
             )
         else:
-            lightning_module = RL_Lightning(
+            lightning_module = AdaptiveRL_Lightning(
                 gen=self.network,
                 vocab=self.vocab,
                 **default_hparams,

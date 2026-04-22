@@ -59,6 +59,7 @@ model = MolGen_LFPOModel(
         "ref_ema_decay": 0.999,
         "lfpo_use_charge_head": True,
         "lfpo_detach_targets": True,
+        "lfpo_time_chunk_size": 0,
     },
 )
 

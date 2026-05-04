@@ -6,7 +6,10 @@ from lightning.pytorch.loggers import TensorBoardLogger
 
 from ..data.datamodule import MGDataModule
 from .interface import MolGen_Model
-from .rl_lfpo_diff import LFPOF_Lightning
+# from .lfpo_f import LFPOF_Lightning
+# from .lfpo_f_top_imitation import LFPOF_Lightning
+# from .lfpo_f_TopBottom_Rectification import LFPOF_Lightning
+from .lift import LIFT_Lightning
 
 
 class MolGen_LFPOModel(MolGen_Model):
@@ -63,7 +66,7 @@ class MolGen_LFPOModel(MolGen_Model):
             default_hparams.update(hparams)
 
         if load_ckpt is not None:
-            return LFPOF_Lightning.load_from_checkpoint(
+            return LIFT_Lightning.load_from_checkpoint(
                 load_ckpt,
                 gen=self.network,
                 vocab=self.vocab,
@@ -71,7 +74,7 @@ class MolGen_LFPOModel(MolGen_Model):
                 strict=False,
                 **default_hparams,
             )
-        return LFPOF_Lightning(gen=self.network, vocab=self.vocab, **default_hparams)
+        return LIFT_Lightning(gen=self.network, vocab=self.vocab, **default_hparams)
 
     def Train(
         self,
@@ -80,7 +83,7 @@ class MolGen_LFPOModel(MolGen_Model):
         test_datafile,
         epochs,
         save_path="./models",
-        project_name="SOTMOL_LFPO",
+        project_name="SOTMOL_LIFT",
         load_ckpt=None,
         lr=1e-4,
         warm_up_steps=10000,
@@ -121,15 +124,22 @@ class MolGen_LFPOModel(MolGen_Model):
             logger = TensorBoardLogger("./TensorBoard", name=project_name, version=None)
 
         lr_monitor = LearningRateMonitor(logging_interval="step")
-        os.makedirs(save_path, exist_ok=True)
+        if logger is not None:
+            ckpt_dir = os.path.join(logger.log_dir, "checkpoints")
+        else:
+            ckpt_dir = save_path
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+
         checkpointing = ModelCheckpoint(
-            dirpath=save_path,
+            dirpath=ckpt_dir,
             save_top_k=3,
             every_n_epochs=1,
-            monitor="train-lfpof-reward-mean",
+            monitor="train-lfpof-reward-current-mean_epoch",
             mode="max",
             save_last=True,
         )
+
 
         trainer = L.Trainer(
             devices=ngpus,
@@ -138,7 +148,7 @@ class MolGen_LFPOModel(MolGen_Model):
             logger=logger,
             log_every_n_steps=log_steps,
             accumulate_grad_batches=acc_batches,
-            gradient_clip_val=gradient_clip_val,
+            # gradient_clip_val=gradient_clip_val,
             callbacks=[lr_monitor, checkpointing],
             precision="32",
             strategy="ddp_find_unused_parameters_true",

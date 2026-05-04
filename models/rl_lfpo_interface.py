@@ -27,6 +27,10 @@ class MolGen_LFPOModel(MolGen_Model):
         anchor_loss_weight=1.0,
         use_reference_anchor=True,
         lfpo_hparams=None,
+        objective_name="qed",
+        objective_config=None,
+        partition_config=None,
+        metric_config=None,
         **kwargs,
     ):
         super().__init__(atom_tokens=atom_tokens, n_bond_types=n_bond_types, coord_std=coord_std, **kwargs)
@@ -39,6 +43,10 @@ class MolGen_LFPOModel(MolGen_Model):
         self.anchor_loss_weight = anchor_loss_weight
         self.use_reference_anchor = use_reference_anchor
         self.lfpo_hparams = lfpo_hparams or {}
+        self.objective_name = objective_name or reward_name
+        self.objective_config = objective_config or {}
+        self.partition_config = partition_config or {}
+        self.metric_config = metric_config or {}
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -60,6 +68,10 @@ class MolGen_LFPOModel(MolGen_Model):
             "anchor_weight": self.anchor_weight,
             "anchor_loss_weight": self.anchor_loss_weight,
             "use_reference_anchor": self.use_reference_anchor,
+            "objective_name": self.objective_name,
+            "objective_config": self.objective_config,
+            "partition_config": self.partition_config,
+            "metric_config": self.metric_config,
         }
         default_hparams.update(self.lfpo_hparams)
         if hparams is not None:
@@ -94,6 +106,7 @@ class MolGen_LFPOModel(MolGen_Model):
         gradient_clip_val=1.0,
         ngpus=1,
         batchsize=16,
+        checkpoint_monitor="train-mpo-current-score-top10-mean_epoch",
     ):
         self.data_module = MGDataModule(
             self.vocab,
@@ -135,7 +148,7 @@ class MolGen_LFPOModel(MolGen_Model):
             dirpath=ckpt_dir,
             save_top_k=3,
             every_n_epochs=1,
-            monitor="train-lfpof-reward-current-mean_epoch",
+            monitor=checkpoint_monitor,
             mode="max",
             save_last=True,
         )

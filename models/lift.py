@@ -157,6 +157,18 @@ class LIFT_Lightning(RL_Lightning):
             torch.tensor(float(values.numel()), device=values.device, dtype=values.dtype)
         )
 
+
+    def _log_masked_mean(self, name, tensor, mask):
+        if mask is None or int(mask.sum())==0:
+            return
+        self.log(name, tensor[mask].mean(), on_step=True, logger=True, sync_dist=True)
+
+    def _safe_corr(self, a, b):
+        a=a.float(); b=b.float()
+        if a.numel()<2: return torch.zeros((),device=a.device)
+        av=a-a.mean(); bv=b-b.mean(); den=(av.std(unbiased=False)*bv.std(unbiased=False)).clamp_min(1e-8)
+        return (av*bv).mean()/den
+
     def _sample_noise_chunk_from_base(self, noise: dict, chunk_size: int) -> dict:
         """Sample a chunk of initial noise/templates from the current training batch.
 
@@ -919,6 +931,38 @@ class LIFT_Lightning(RL_Lightning):
             self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
         for k, v in scoring_ref.raw_properties.items():
             self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+        if "sim_ranolazine_AP" in scoring_ref.raw_properties:
+            rs = scoring_ref.raw_properties["sim_ranolazine_AP"]; csim = scoring_ref.component_scores.get("sim_ranolazine_AP", rs)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-mean", rs.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-sim_ranolazine_AP-mean", csim.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-top10", self._top_frac_mean(rs,0.1), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-max", rs.max(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-sim_ranolazine_AP-std", csim.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-std", rs.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
+            self._log_masked_mean("train-mpo-ref-top-raw-sim_ranolazine_AP-mean", rs, top_mask)
+            self._log_masked_mean("train-mpo-ref-bottom-raw-sim_ranolazine_AP-mean", rs, bottom_mask)
+        if "num_F" in scoring_ref.raw_properties:
+            rn = scoring_ref.raw_properties["num_F"]; cn = scoring_ref.component_scores.get("num_F", rn)
+            self.log("train-mpo-ref-all-raw-num_F-mean", rn.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-num_F-mean", cn.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-frac-num_F-eq-1", (rn==1).float().mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-frac-num_F-gt-0", (rn>0).float().mean(), on_step=True, logger=True, sync_dist=True)
+            self._log_masked_mean("train-mpo-ref-top-raw-num_F-mean", rn, top_mask)
+            self._log_masked_mean("train-mpo-ref-top-comp-num_F-mean", cn, top_mask)
+            self._log_masked_mean("train-mpo-ref-bottom-raw-num_F-mean", rn, bottom_mask)
+        if partition_ref.pareto_rank is not None:
+            self.log("train-partition-ref-pareto-rank-mean", partition_ref.pareto_rank.float().mean(), on_step=True, logger=True, sync_dist=True)
+        for dk,dv in partition_ref.diagnostics.items():
+            self.log(f"train-partition-ref-{dk.replace('_','-')}", dv, on_step=True, logger=True, sync_dist=True)
+        if scoring_ref.metadata.get("official_score") is not None:
+            self.log("train-mpo-ref-official-score-mean", scoring_ref.metadata["official_score"].mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-geometric-score-mean", scoring_ref.metadata.get("geometric_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-tchebycheff-score-mean", scoring_ref.metadata.get("tchebycheff_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-min-component-mean", scoring_ref.metadata.get("min_component_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        if "sim_ranolazine_AP" in scoring_ref.component_scores:
+            self.log("train-mpo-ref-corr-score-comp-sim", self._safe_corr(scoring_ref.score, scoring_ref.component_scores["sim_ranolazine_AP"]), on_step=True, logger=True, sync_dist=True)
+        if "num_F" in scoring_ref.component_scores:
+            self.log("train-mpo-ref-corr-score-comp-numF", self._safe_corr(scoring_ref.score, scoring_ref.component_scores["num_F"]), on_step=True, logger=True, sync_dist=True)
 
         if rewards_cur is not None:
             self.log("train-lfpof-reward-current-mean", rewards_cur.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)

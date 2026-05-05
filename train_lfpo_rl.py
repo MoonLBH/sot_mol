@@ -11,6 +11,10 @@ from sot_mol.models.rl_lfpo_interface import MolGen_LFPOModel
 
 parser = arg.ArgumentParser(description="LFPO-F FM RL quick test")
 parser.add_argument("--config", type=str, default="rl.json")
+parser.add_argument("--objective_name", type=str, default="qed")
+parser.add_argument("--partition_mode", type=str, default="scalar_top_bottom")
+parser.add_argument("--oracle_log_path", type=str, default="")
+parser.add_argument("--run_block1", action="store_true")
 args = parser.parse_args()
 
 script_dir = Path(__file__).resolve().parent
@@ -28,6 +32,12 @@ import torch._dynamo
 
 torch._dynamo.config.suppress_errors = True
 
+BLOCK1_TASKS = ["Ranolazine_MPO", "Osimertinib_MPO", "Fexofenadine_MPO", "Sitagliptin_MPO"]
+objective_name = args.objective_name
+objective_config = {"aggregate": "official" if objective_name != "qed" else "geometric", "use_official_guacamol": True, "fallback_aggregate": "geometric", "pareto_component_names": ["sim_ranolazine_AP", "logP", "TPSA", "num_F"], "feasibility": {"valid": True, "connected": True}}
+partition_config = {"mode": args.partition_mode, "top_ratio": 0.25, "bottom_ratio": 0.25, "pareto_rank_max": 1, "top_candidate_quantile": 0.7, "diversity_mode": "scaffold", "bottom_mode": "unusable_region", "bottom_priority": ["invalid", "severe", "component_floor", "dominated", "low_score"], "bad_rank_quantile": 0.75, "low_score_quantile": 0.25, "top_selection_score_mode": "component_balanced", "top_selection_component_weights": {"sim_ranolazine_AP": 2.0, "num_F": 2.0}, "use_min_component_bonus": True, "min_component_weight": 1.0, "bottom_component_floor": {"num_F": 0.60}, "bottom_floor_type": "component", "log_component_floor": {"sim_ranolazine_AP": 0.05}}
+metric_config = {"enabled": bool(args.oracle_log_path), "oracle_log_path": args.oracle_log_path if args.oracle_log_path else str(script_dir / "oracle_logs" / f"{objective_name}.csv"), "novelty_reference_path": str(script_dir / "train_smiles.txt"), "log_ref_train": True, "log_current_eval": True}
+
 model = MolGen_LFPOModel(
     d_model=GP.D_MODEL,
     atom_tokens=GP.TOKENS,
@@ -40,6 +50,10 @@ model = MolGen_LFPOModel(
     eval_3D_props=False,
     ot_bond_weight=1,
     reward_name="qed",
+    objective_name=objective_name,
+    objective_config=objective_config,
+    partition_config=partition_config,
+    metric_config=metric_config,
     anchor_weight=0.1,
     anchor_loss_weight=1.0,
     use_reference_anchor=True,

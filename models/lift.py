@@ -7,6 +7,9 @@ import torch.nn.functional as F
 
 from .rl_diff import RL_Lightning
 from ..util.functional import adj_from_node_mask
+from ..rl_objectives.mpo_tasks import build_objective
+from ..rl_objectives.partition import build_partition_selector
+from ..rl_objectives.oracle_metrics import OracleLogger
 
 
 class LIFT_Lightning(RL_Lightning):
@@ -60,6 +63,10 @@ class LIFT_Lightning(RL_Lightning):
         lfpo_middle_weight: float = 0.0,
         lfpo_use_top_bottom: bool = True,
         lfpo_top_weight_mode: str = "uniform",
+        objective_name: str = "qed",
+        objective_config: dict | None = None,
+        partition_config: dict | None = None,
+        metric_config: dict | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -98,7 +105,15 @@ class LIFT_Lightning(RL_Lightning):
         self.lfpo_middle_weight = float(lfpo_middle_weight)
         self.lfpo_use_top_bottom = bool(lfpo_use_top_bottom)
         self.lfpo_top_weight_mode = str(lfpo_top_weight_mode).lower()
-
+        if objective_name is None:
+            objective_name = kwargs.get("reward_name", "qed")
+        self.objective_name = objective_name
+        self.objective_config = objective_config or {}
+        self.partition_config = partition_config or {"mode":"scalar_top_bottom", "top_ratio": self.lfpo_top_ratio, "bottom_ratio": self.lfpo_bottom_ratio}
+        self.metric_config = metric_config or {}
+        self.objective = build_objective(self.objective_name, self.objective_config)
+        self.partition_selector = build_partition_selector(self.partition_config)
+        self.oracle_logger = OracleLogger(self.metric_config.get("oracle_log_path"), self.objective_name, enabled=self.metric_config.get("enabled", False), novelty_reference_path=self.metric_config.get("novelty_reference_path")) if self.metric_config.get("enabled", False) else None
 
         if self.lfpo_disable_base_ema:
             # Disable the extra averaged model to save GPU memory.
@@ -142,6 +157,18 @@ class LIFT_Lightning(RL_Lightning):
             torch.tensor(float(values.numel()), device=values.device, dtype=values.dtype)
         )
 
+
+    def _log_masked_mean(self, name, tensor, mask):
+        if mask is None or int(mask.sum())==0:
+            return
+        self.log(name, tensor[mask].mean(), on_step=True, logger=True, sync_dist=True)
+
+    def _safe_corr(self, a, b):
+        a=a.float(); b=b.float()
+        if a.numel()<2: return torch.zeros((),device=a.device)
+        av=a-a.mean(); bv=b-b.mean(); den=(av.std(unbiased=False)*bv.std(unbiased=False)).clamp_min(1e-8)
+        return (av*bv).mean()/den
+
     def _sample_noise_chunk_from_base(self, noise: dict, chunk_size: int) -> dict:
         """Sample a chunk of initial noise/templates from the current training batch.
 
@@ -162,7 +189,7 @@ class LIFT_Lightning(RL_Lightning):
                 out[key] = value
         return out
 
-    def _evaluate_model_rewards(
+    def _evaluate_model_scoring(
         self,
         model: torch.nn.Module,
         base_noise: dict,
@@ -176,7 +203,7 @@ class LIFT_Lightning(RL_Lightning):
         """
         n_samples = max(1, int(n_samples))
         eval_batch_size = max(1, int(eval_batch_size))
-        rewards_all = []
+        scoring_all = []
         mols_all = []
 
         for start in range(0, n_samples, eval_batch_size):
@@ -190,13 +217,14 @@ class LIFT_Lightning(RL_Lightning):
                     coord_noise_std=self.default_coord_noise_std,
                     cat_noise_level=self.default_cat_noise_level,
                 )
-            rewards_chunk, mols_chunk = self._compute_rewards_from_generated(generated)
-            rewards_all.append(rewards_chunk.detach())
+            mols_chunk = self._generate_mols(generated, sanitise=True)
+            scoring_chunk = self.objective.score_mols(mols_chunk, device=generated["coords"].device, dtype=generated["coords"].dtype)
+            scoring_all.append(scoring_chunk.score.detach())
             mols_all.extend(mols_chunk)
 
-            del noise_chunk, generated, rewards_chunk
+            del noise_chunk, generated
 
-        rewards = torch.cat(rewards_all, dim=0)
+        rewards = torch.cat(scoring_all, dim=0)
         quality_metrics = self._compute_generation_quality_from_mols(
             mols_all,
             dtype=rewards.dtype,
@@ -523,29 +551,28 @@ class LIFT_Lightning(RL_Lightning):
                 cat_noise_level=self.default_cat_noise_level,
             )
 
-        rewards_ref, generated_mols_ref = self._compute_rewards_from_generated(generated_ref)
-        quality_metrics_ref = self._compute_generation_quality_from_mols(
-            generated_mols_ref,
-            dtype=generated_ref["coords"].dtype,
-            device=generated_ref["coords"].device,
-        )
+        generated_mols_ref = self._generate_mols(generated_ref, sanitise=True)
+        scoring_ref = self.objective.score_mols(generated_mols_ref, device=generated_ref["coords"].device, dtype=generated_ref["coords"].dtype)
+        quality_metrics_ref = self._compute_generation_quality_from_mols(generated_mols_ref, dtype=generated_ref["coords"].dtype, device=generated_ref["coords"].device)
 
-        # Soft pull weights are kept for logging/diagnosis. The main LFPO-F-v2
-        # objective below uses hard top/bottom masks.
-        pull_w = self._reward_to_pull_weights(rewards_ref)
-        top_mask, bottom_mask, selected_mask = self._reward_to_top_bottom_masks(rewards_ref)
+        pull_w = self._reward_to_pull_weights(scoring_ref.score)
+        partition_ref = self.partition_selector.select(scoring_ref)
+        rewards_ref = scoring_ref.score
+        top_mask = partition_ref.top_mask
+        bottom_mask = partition_ref.bottom_mask
+        selected_mask = partition_ref.selected_mask
         
         # Weight for top-reward imitation.
         # Default: all selected top samples have weight 1.
         # Optional: reward-normalized top weighting, with mean weight = 1 within top set.
-        top_imitation_w = torch.ones_like(rewards_ref)
+        top_imitation_w = partition_ref.top_weights if partition_ref is not None else torch.ones_like(rewards_ref)
 
         if self.lfpo_top_weight_mode == "rwr":
             if top_mask.any():
                 top_mean = pull_w[top_mask].mean().clamp_min(self.reward_norm_eps)
                 top_imitation_w = pull_w / top_mean
             else:
-                top_imitation_w = torch.ones_like(rewards_ref)
+                top_imitation_w = partition_ref.top_weights if partition_ref is not None else torch.ones_like(rewards_ref)
 
         train_batch = self._build_generated_target_batch(batch, generated_ref)
 
@@ -559,7 +586,7 @@ class LIFT_Lightning(RL_Lightning):
         if self.lfpo_log_current_reward and (
             self.global_step % max(1, self.lfpo_eval_current_every) == 0
         ):
-            rewards_cur, generated_mols_cur, quality_metrics_cur = self._evaluate_model_rewards(
+            rewards_cur, generated_mols_cur, quality_metrics_cur = self._evaluate_model_scoring(
                 model=self.gen,
                 base_noise=noise,
                 n_samples=self.lfpo_eval_current_samples,
@@ -894,6 +921,48 @@ class LIFT_Lightning(RL_Lightning):
         self.log("train-gen-ref-connected-validity", quality_metrics_ref["connected-validity"], on_step=True, on_epoch=True, logger=True, sync_dist=True)
         self.log("train-gen-ref-n-valid", quality_metrics_ref["n-valid"], on_step=True, logger=True, sync_dist=True)
         self.log("train-gen-ref-n-total", quality_metrics_ref["n-total"], on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-score-mean", scoring_ref.score.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-score-top10-mean", self._top_frac_mean(scoring_ref.score, 0.1), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-feasible-frac", scoring_ref.feasible.float().mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-severe-frac", scoring_ref.severe_violation.float().mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-top-frac", top_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-bottom-frac", bottom_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
+        for k, v in scoring_ref.component_scores.items():
+            self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+        for k, v in scoring_ref.raw_properties.items():
+            self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+        if "sim_ranolazine_AP" in scoring_ref.raw_properties:
+            rs = scoring_ref.raw_properties["sim_ranolazine_AP"]; csim = scoring_ref.component_scores.get("sim_ranolazine_AP", rs)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-mean", rs.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-sim_ranolazine_AP-mean", csim.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-top10", self._top_frac_mean(rs,0.1), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-max", rs.max(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-sim_ranolazine_AP-std", csim.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-std", rs.std(unbiased=False), on_step=True, logger=True, sync_dist=True)
+            self._log_masked_mean("train-mpo-ref-top-raw-sim_ranolazine_AP-mean", rs, top_mask)
+            self._log_masked_mean("train-mpo-ref-bottom-raw-sim_ranolazine_AP-mean", rs, bottom_mask)
+        if "num_F" in scoring_ref.raw_properties:
+            rn = scoring_ref.raw_properties["num_F"]; cn = scoring_ref.component_scores.get("num_F", rn)
+            self.log("train-mpo-ref-all-raw-num_F-mean", rn.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-comp-num_F-mean", cn.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-frac-num_F-eq-1", (rn==1).float().mean(), on_step=True, logger=True, sync_dist=True)
+            self.log("train-mpo-ref-all-frac-num_F-gt-0", (rn>0).float().mean(), on_step=True, logger=True, sync_dist=True)
+            self._log_masked_mean("train-mpo-ref-top-raw-num_F-mean", rn, top_mask)
+            self._log_masked_mean("train-mpo-ref-top-comp-num_F-mean", cn, top_mask)
+            self._log_masked_mean("train-mpo-ref-bottom-raw-num_F-mean", rn, bottom_mask)
+        if partition_ref.pareto_rank is not None:
+            self.log("train-partition-ref-pareto-rank-mean", partition_ref.pareto_rank.float().mean(), on_step=True, logger=True, sync_dist=True)
+        for dk,dv in partition_ref.diagnostics.items():
+            self.log(f"train-partition-ref-{dk.replace('_','-')}", dv, on_step=True, logger=True, sync_dist=True)
+        if scoring_ref.metadata.get("official_score") is not None:
+            self.log("train-mpo-ref-official-score-mean", scoring_ref.metadata["official_score"].mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-geometric-score-mean", scoring_ref.metadata.get("geometric_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-tchebycheff-score-mean", scoring_ref.metadata.get("tchebycheff_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-min-component-mean", scoring_ref.metadata.get("min_component_score", scoring_ref.score).mean(), on_step=True, logger=True, sync_dist=True)
+        if "sim_ranolazine_AP" in scoring_ref.component_scores:
+            self.log("train-mpo-ref-corr-score-comp-sim", self._safe_corr(scoring_ref.score, scoring_ref.component_scores["sim_ranolazine_AP"]), on_step=True, logger=True, sync_dist=True)
+        if "num_F" in scoring_ref.component_scores:
+            self.log("train-mpo-ref-corr-score-comp-numF", self._safe_corr(scoring_ref.score, scoring_ref.component_scores["num_F"]), on_step=True, logger=True, sync_dist=True)
 
         if rewards_cur is not None:
             self.log("train-lfpof-reward-current-mean", rewards_cur.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)
@@ -913,6 +982,10 @@ class LIFT_Lightning(RL_Lightning):
                 self.log("train-gen-current-connected-validity", quality_metrics_cur["connected-validity"], on_step=True, logger=True, sync_dist=True)
                 self.log("train-gen-current-n-valid", quality_metrics_cur["n-valid"], on_step=True, logger=True, sync_dist=True)
                 self.log("train-gen-current-n-total", quality_metrics_cur["n-total"], on_step=True, logger=True, sync_dist=True)
+                self.log("train-mpo-current-score-mean", rewards_cur.mean(), on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log("train-mpo-current-score-sem", self._sem(rewards_cur), on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log("train-mpo-current-score-top10-mean", self._top_frac_mean(rewards_cur, 0.1), on_step=True, on_epoch=True, logger=True, sync_dist=True)
+                self.log("train-mpo-current-score-top1", torch.max(rewards_cur), on_step=True, on_epoch=True, logger=True, sync_dist=True)
                 for key in [
                     "strain-energy-mean",
                     "strain-energy-median",
@@ -922,6 +995,14 @@ class LIFT_Lightning(RL_Lightning):
                 ]:
                     if key in quality_metrics_cur:
                         self.log(f"train-gen-current-{key}", quality_metrics_cur[key], on_step=True, on_epoch=True, logger=True, sync_dist=True)
+
+
+        if self.oracle_logger is not None and getattr(self.trainer, "global_rank", 0) == 0:
+            if self.metric_config.get("log_ref_train", True):
+                self.oracle_logger.log_batch(int(self.global_step), "ref_train", scoring_ref, partition_ref)
+            if rewards_cur is not None and self.metric_config.get("log_current_eval", True):
+                scoring_cur = self.objective.score_mols(generated_mols_cur, device=rewards_cur.device, dtype=rewards_cur.dtype)
+                self.oracle_logger.log_batch(int(self.global_step), "current_eval", scoring_cur, None)
 
         return total_loss_log.detach()
 

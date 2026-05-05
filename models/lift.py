@@ -561,6 +561,9 @@ class LIFT_Lightning(RL_Lightning):
         top_mask = partition_ref.top_mask
         bottom_mask = partition_ref.bottom_mask
         selected_mask = partition_ref.selected_mask
+        overlap = (top_mask & bottom_mask)
+        if torch.any(overlap):
+            raise RuntimeError("Partition overlap detected: top and bottom masks overlap")
         
         # Weight for top-reward imitation.
         # Default: all selected top samples have weight 1.
@@ -927,10 +930,26 @@ class LIFT_Lightning(RL_Lightning):
         self.log("train-partition-ref-severe-frac", scoring_ref.severe_violation.float().mean(), on_step=True, logger=True, sync_dist=True)
         self.log("train-partition-ref-top-frac", top_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
         self.log("train-partition-ref-bottom-frac", bottom_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-top-count", top_mask.float().sum(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-bottom-count", bottom_mask.float().sum(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-selected-count", selected_mask.float().sum(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-overlap-count", (top_mask & bottom_mask).float().sum(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-top-empty", torch.tensor(float(top_mask.sum()==0), device=top_mask.device), on_step=True, logger=True, sync_dist=True)
+        self.log("train-partition-ref-bottom-empty", torch.tensor(float(bottom_mask.sum()==0), device=top_mask.device), on_step=True, logger=True, sync_dist=True)
         for k, v in scoring_ref.component_scores.items():
             self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
         for k, v in scoring_ref.raw_properties.items():
             self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+        if "TPSA" in scoring_ref.raw_properties:
+            self.log("train-mpo-ref-raw-TPSA-mean", scoring_ref.raw_properties["TPSA"].mean(), on_step=True, logger=True, sync_dist=True)
+            if scoring_ref.valid.any():
+                self.log("train-mpo-ref-valid-raw-TPSA-mean", scoring_ref.raw_properties["TPSA"][scoring_ref.valid].mean(), on_step=True, logger=True, sync_dist=True)
+        if "logP" in scoring_ref.raw_properties:
+            self.log("train-mpo-ref-raw-logP-mean", scoring_ref.raw_properties["logP"].mean(), on_step=True, logger=True, sync_dist=True)
+            if scoring_ref.valid.any():
+                self.log("train-mpo-ref-valid-raw-logP-mean", scoring_ref.raw_properties["logP"][scoring_ref.valid].mean(), on_step=True, logger=True, sync_dist=True)
+        self.log("train-mpo-ref-valid-frac", scoring_ref.valid.float().mean(), on_step=True, logger=True, sync_dist=True)
+
         if "sim_ranolazine_AP" in scoring_ref.raw_properties:
             rs = scoring_ref.raw_properties["sim_ranolazine_AP"]; csim = scoring_ref.component_scores.get("sim_ranolazine_AP", rs)
             self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-mean", rs.mean(), on_step=True, logger=True, sync_dist=True)

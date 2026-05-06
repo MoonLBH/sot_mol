@@ -173,11 +173,47 @@ class PartitionSelector:
         top_candidate_mask = torch.zeros_like(top_mask)
         top_candidates = []
 
+        sim_quota_idx = []
+        score_quota_idx = []
+
+        def _apply_similarity_priority(base_pick, candidate_indices):
+            if not bool(self.cfg.get("similarity_priority_enabled", False)):
+                return base_pick, [], list(base_pick)
+            skey = self.cfg.get("similarity_key", "sim_ranolazine_AP")
+            ssrc = self.cfg.get("similarity_source", "raw")
+            if ssrc == "component":
+                store = scoring.component_scores
+            else:
+                store = scoring.raw_properties
+            if skey not in store:
+                warnings.warn(f"similarity key '{skey}' missing; fallback to original top selection")
+                return base_pick, [], list(base_pick)
+            simv = store[skey]
+            sim_n = min(top_n, int(math.ceil(top_n * float(self.cfg.get("similarity_top_quota", 0.5)))))
+            score_n = max(0, top_n - sim_n)
+            cand = list(candidate_indices)
+            if not cand:
+                return [], [], []
+            cidx = torch.tensor(cand, dtype=torch.long, device=score.device)
+            order = cidx[torch.argsort(simv.index_select(0, cidx), descending=True)].tolist()
+            smin = self.cfg.get("similarity_min_value")
+            if smin is not None:
+                good = [i for i in order if float(simv[i]) >= float(smin)]
+                order = good + [i for i in order if i not in set(good)]
+            sim_pick = order[:sim_n]
+            remaining = [i for i in cand if i not in set(sim_pick)] if self.cfg.get("similarity_exclude_already_selected", True) else cand
+            score_pick = sorted(remaining, key=lambda i: float(top_score[i]), reverse=True)[:score_n]
+            final = (sim_pick + score_pick)[:top_n]
+            return final, sim_pick, score_pick
+
         # ---- Top selection by mode ----
         if mode == "scalar_top_bottom":
             order = torch.argsort(top_score, descending=True)
             top_pick = order[:top_n]
-            top_mask[top_pick] = True
+            base_pick = top_pick.tolist()
+            picked, sim_quota_idx, score_quota_idx = _apply_similarity_priority(base_pick, order.tolist())
+            if picked:
+                top_mask[torch.tensor(picked, dtype=torch.long, device=score.device)] = True
             top_candidate_mask = torch.ones_like(top_mask)
             top_candidates = order.tolist()
         elif mode in ("feasible_score", "feasible_pareto", "feasible_pareto_diverse"):
@@ -203,12 +239,11 @@ class PartitionSelector:
                 diversity_mode = str(self.cfg.get("diversity_mode", "none")).lower()
             else:
                 diversity_mode = "none"
-
             if diversity_mode == "scaffold":
-                picked = select_scaffold_diverse(top_candidates, top_score.detach().cpu(), scoring.scaffolds, top_n)
+                base_picked = select_scaffold_diverse(top_candidates, top_score.detach().cpu(), scoring.scaffolds, top_n)
             elif diversity_mode == "fingerprint":
                 rank_for_div = pareto_rank.detach().cpu().tolist() if pareto_rank is not None else [999] * b
-                picked = select_fingerprint_diverse(top_candidates, top_score.detach().cpu(), scoring.fps, rank_for_div, top_n)
+                base_picked = select_fingerprint_diverse(top_candidates, top_score.detach().cpu(), scoring.fps, rank_for_div, top_n)
             elif diversity_mode == "crowding" and pareto_rank is not None:
                 picked = []
                 remaining = set(top_candidates)
@@ -223,8 +258,10 @@ class PartitionSelector:
                         remaining.remove(i)
                         if len(picked) >= top_n:
                             break
+                base_picked = picked
             else:
-                picked = sorted(top_candidates, key=lambda i: float(top_score[i]), reverse=True)[:top_n]
+                base_picked = sorted(top_candidates, key=lambda i: float(top_score[i]), reverse=True)[:top_n]
+            picked, sim_quota_idx, score_quota_idx = _apply_similarity_priority(base_picked, top_candidates)
             if picked:
                 top_mask[torch.tensor(picked, dtype=torch.long, device=score.device)] = True
         else:
@@ -316,6 +353,20 @@ class PartitionSelector:
         for rk in reason_keys:
             cnt = sum(1 for r in bottom_reasons if r == rk)
             diagnostics[f"bottom_reason_{rk}_frac"] = torch.tensor(float(cnt) / max(1, b), device=score.device)
+        diagnostics["similarity_priority_enabled"] = torch.tensor(1.0 if bool(self.cfg.get("similarity_priority_enabled", False)) else 0.0, device=score.device)
+        diagnostics["similarity_quota_count"] = torch.tensor(float(len(sim_quota_idx)), device=score.device)
+        diagnostics["score_quota_count"] = torch.tensor(float(len(score_quota_idx)), device=score.device)
+        sim_key = self.cfg.get("similarity_key", "sim_ranolazine_AP")
+        if sim_key in scoring.raw_properties and top_mask.any():
+            top_idx = torch.where(top_mask)[0]
+            diagnostics["top_selected_raw_sim_mean"] = scoring.raw_properties[sim_key].index_select(0, top_idx).mean()
+            diagnostics["top_selected_raw_sim_max"] = scoring.raw_properties[sim_key].index_select(0, top_idx).max()
+            if sim_quota_idx:
+                si = torch.tensor(sim_quota_idx, dtype=torch.long, device=score.device)
+                diagnostics["similarity_quota_raw_sim_mean"] = scoring.raw_properties[sim_key].index_select(0, si).mean()
+            if score_quota_idx:
+                qi = torch.tensor(score_quota_idx, dtype=torch.long, device=score.device)
+                diagnostics["score_quota_raw_sim_mean"] = scoring.raw_properties[sim_key].index_select(0, qi).mean()
 
         return PartitionResult(
             top_mask=top_mask,

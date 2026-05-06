@@ -12,6 +12,67 @@ from ..rl_objectives.partition import build_partition_selector
 from ..rl_objectives.mpo_tasks import ScoringResult
 from ..rl_objectives.oracle_metrics import OracleLogger
 
+class SimilarityArchive:
+    def __init__(self, cfg):
+        self.cfg = cfg or {}
+        self.capacity = int(self.cfg.get("capacity", 2048))
+        self.key = self.cfg.get("key", "sim_ranolazine_AP")
+        self.source = self.cfg.get("source", "raw")
+        self.min_value = float(self.cfg.get("min_value", 0.03))
+        self.deduplicate = bool(self.cfg.get("deduplicate_smiles", True))
+        self.items = []
+        self.by_smiles = {}
+        self.last_stats = {"added": 0, "duplicate_skipped": 0}
+
+    def __len__(self):
+        return len(self.items)
+
+    def _score_values(self, scoring):
+        src = scoring.raw_properties if self.source == "raw" else scoring.component_scores
+        return src.get(self.key)
+
+    def update(self, scoring, target_batch):
+        vals = self._score_values(scoring)
+        self.last_stats = {"added": 0, "duplicate_skipped": 0}
+        if vals is None:
+            return
+        topk = int(self.cfg.get("update_top_k", 32))
+        idx = torch.where(vals >= self.min_value)[0]
+        if idx.numel() == 0:
+            return
+        order = idx[torch.argsort(vals.index_select(0, idx), descending=True)][:topk]
+        for i in order.tolist():
+            cano = scoring.canonical_smiles[i]
+            if self.deduplicate and cano is not None and cano in self.by_smiles:
+                self.last_stats["duplicate_skipped"] += 1
+                continue
+            entry = {"score": float(vals[i]), "canonical_smiles": cano, "data": {}}
+            for k, v in target_batch.items():
+                if torch.is_tensor(v) and v.size(0) > i:
+                    entry["data"][k] = v[i : i + 1].detach().cpu()
+            self.items.append(entry)
+            if self.deduplicate and cano is not None:
+                self.by_smiles[cano] = len(self.items) - 1
+            self.last_stats["added"] += 1
+        self.items = sorted(self.items, key=lambda x: x["score"], reverse=True)[: self.capacity]
+
+    def sample(self, n, device):
+        if n <= 0 or len(self.items) == 0:
+            return None, None
+        n = min(n, len(self.items))
+        choose = self.items[:n]
+        out = {}
+        for key in choose[0]["data"].keys():
+            out[key] = torch.cat([e["data"][key] for e in choose], dim=0).to(device)
+        scores = torch.tensor([e["score"] for e in choose], device=device, dtype=out["real_coords"].dtype)
+        return out, scores
+
+    def state_dict(self):
+        return {"items": self.items}
+
+    def load_state_dict(self, state):
+        self.items = state.get("items", [])
+
 
 class LIFT_Lightning(RL_Lightning):
     """
@@ -68,6 +129,7 @@ class LIFT_Lightning(RL_Lightning):
         objective_config: dict | None = None,
         partition_config: dict | None = None,
         metric_config: dict | None = None,
+        archive_config: dict | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -112,7 +174,11 @@ class LIFT_Lightning(RL_Lightning):
         self.objective_config = objective_config or {}
         self.partition_config = partition_config or {"mode":"scalar_top_bottom", "top_ratio": self.lfpo_top_ratio, "bottom_ratio": self.lfpo_bottom_ratio}
         self.metric_config = metric_config or {}
+        self.archive_config = archive_config or {}
         self.log_debug_metrics = bool(self.metric_config.get("log_debug_metrics", False))
+        self.archive_enabled = bool(self.archive_config.get("enabled", False))
+        self.archive_top_weight = float(self.archive_config.get("archive_top_weight", 1.0))
+        self.similarity_archive = SimilarityArchive(self.archive_config) if self.archive_enabled else None
         self.objective = build_objective(self.objective_name, self.objective_config)
         self.partition_selector = build_partition_selector(self.partition_config)
         self.oracle_logger = OracleLogger(self.metric_config.get("oracle_log_path"), self.objective_name, enabled=self.metric_config.get("enabled", False), novelty_reference_path=self.metric_config.get("novelty_reference_path")) if self.metric_config.get("enabled", False) else None
@@ -610,7 +676,22 @@ class LIFT_Lightning(RL_Lightning):
             else:
                 top_imitation_w = partition_ref.top_weights if partition_ref is not None else torch.ones_like(rewards_ref)
 
-        train_batch = self._build_generated_target_batch(batch, generated_ref)
+        train_batch_current = self._build_generated_target_batch(batch, generated_ref)
+        train_batch = train_batch_current
+        archive_sample_count = 0
+        if self.archive_enabled and self.similarity_archive is not None:
+            self.similarity_archive.update(scoring_ref, train_batch_current)
+            warmup = int(self.archive_config.get("warmup_steps", 0))
+            if int(self.global_step) >= warmup:
+                want = int(self.archive_config.get("sample_size", 32))
+                max_by_ratio = int(math.ceil(train_batch_current["natoms"].size(0) * float(self.archive_config.get("mix_ratio", 0.25))))
+                archive_n = min(want, max_by_ratio)
+                archive_batch, archive_scores = self.similarity_archive.sample(archive_n, device=device)
+                if archive_batch is not None:
+                    archive_sample_count = int(archive_batch["natoms"].size(0))
+                    for k, v in archive_batch.items():
+                        if k in train_batch and torch.is_tensor(train_batch[k]):
+                            train_batch[k] = torch.cat([train_batch[k], v], dim=0)
 
         # ------------------------------------------------------------------
         # Optional low-frequency evaluation of current policy.
@@ -630,7 +711,14 @@ class LIFT_Lightning(RL_Lightning):
             )
             cur_top_mask, cur_bottom_mask, _ = self._reward_to_top_bottom_masks(scoring_cur.score)
 
+        batch_size_current = train_batch_current["natoms"].size(0)
         batch_size = train_batch["natoms"].size(0)
+        if archive_sample_count > 0:
+            top_mask = torch.cat([top_mask, torch.ones(archive_sample_count, dtype=torch.bool, device=device)], dim=0)
+            bottom_mask = torch.cat([bottom_mask, torch.zeros(archive_sample_count, dtype=torch.bool, device=device)], dim=0)
+            selected_mask = torch.cat([selected_mask, torch.ones(archive_sample_count, dtype=selected_mask.dtype, device=device)], dim=0)
+            top_imitation_w = torch.cat([top_imitation_w, torch.full((archive_sample_count,), self.archive_top_weight, device=device, dtype=top_imitation_w.dtype)], dim=0)
+            pull_w = torch.cat([pull_w, torch.ones(archive_sample_count, device=device, dtype=pull_w.dtype)], dim=0)
         t_bk = self._sample_stratified_timesteps(
             batch_size=batch_size,
             K=self.lfpo_num_time_samples,
@@ -1046,6 +1134,15 @@ class LIFT_Lightning(RL_Lightning):
                         self.log(f"train-gen-current-{key}", quality_metrics_cur[key], on_step=True, on_epoch=True, logger=True, sync_dist=True)
 
 
+        if self.archive_enabled and self.similarity_archive is not None and self.archive_config.get("log_archive", True):
+            asize = len(self.similarity_archive)
+            self.log("train-archive-size", float(asize), on_step=True, logger=True, sync_dist=False)
+            self.log("train-archive-sample-count", float(archive_sample_count), on_step=True, logger=True, sync_dist=False)
+            self.log("train-archive-min-threshold", float(self.similarity_archive.min_value), on_step=True, logger=True, sync_dist=False)
+            self.log("train-archive-update-count", float(self.similarity_archive.last_stats.get("added", 0)), on_step=True, logger=True, sync_dist=False)
+            self._log_debug("train-archive-added-this-step", float(self.similarity_archive.last_stats.get("added", 0)), on_step=True, logger=True, sync_dist=False)
+            self._log_debug("train-archive-duplicate-skipped", float(self.similarity_archive.last_stats.get("duplicate_skipped", 0)), on_step=True, logger=True, sync_dist=False)
+
         if self.oracle_logger is not None and getattr(self.trainer, "global_rank", 0) == 0:
             if self.metric_config.get("log_ref_train", True):
                 self.oracle_logger.log_batch(int(self.global_step), "ref_train", scoring_ref, partition_ref)
@@ -1053,6 +1150,14 @@ class LIFT_Lightning(RL_Lightning):
                 self.oracle_logger.log_batch(int(self.global_step), "current_eval", scoring_cur, None)
 
         return total_loss_log.detach()
+
+    def on_save_checkpoint(self, checkpoint):
+        if self.archive_enabled and self.similarity_archive is not None:
+            checkpoint["similarity_archive_state"] = self.similarity_archive.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if self.archive_enabled and self.similarity_archive is not None and "similarity_archive_state" in checkpoint:
+            self.similarity_archive.load_state_dict(checkpoint["similarity_archive_state"])
 
     def training_step(self, batch, b_idx):
         batch = self.flatten_batch(batch)

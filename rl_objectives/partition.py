@@ -35,11 +35,10 @@ class PartitionSelector:
         names=list(scoring.component_scores.keys())
         comp_stack=torch.stack([scoring.component_scores[k] for k in names],dim=1)
         min_comp=comp_stack.min(dim=1).values
-        enable_bal = self.cfg.get("enable_component_balanced_top", False)
-        if enable_bal and mode in ("component_balanced","score_plus_min_component"):
+        if mode in ("component_balanced","score_plus_min_component"):
             for k,w in self.cfg.get("top_selection_component_weights",{}).items():
                 if k in scoring.component_scores: base = base + float(w)*scoring.component_scores[k]
-        if self.cfg.get("enable_min_component_bonus", False) and (self.cfg.get("use_min_component_bonus",False) or mode in ("component_balanced","score_plus_min_component")):
+        if self.cfg.get("use_min_component_bonus",False) or mode in ("component_balanced","score_plus_min_component"):
             base = base + float(self.cfg.get("min_component_weight",1.0))*min_comp
         if mode=="tchebycheff":
             base = tchebycheff_score(scoring.component_scores, self.cfg.get("top_selection_component_weights"))
@@ -67,12 +66,10 @@ class PartitionSelector:
             lowq=torch.quantile(score,self.cfg.get("low_score_quantile",0.25)); low=score<=lowq
             domm=(pareto_rank>=int(torch.quantile(pareto_rank[scoring.feasible].float(),self.cfg.get("bad_rank_quantile",0.75)).item())) if scoring.feasible.any() else torch.zeros_like(top)
             floor=torch.zeros_like(top)
-            if self.cfg.get("enable_component_floor_bottom", False):
-                for k,v in self.cfg.get("bottom_component_floor",{}).items():
-                    if k in scoring.component_scores:
-                        m=scoring.component_scores[k] < float(v); floor |= m
+            for k,v in self.cfg.get("bottom_component_floor",{}).items():
+                if k in scoring.component_scores:
+                    m=scoring.component_scores[k] < float(v); floor |= m
             pmap={"invalid":inv,"severe":sev,"component_floor":floor,"dominated":domm,"low_score":low}
-            overlap = top & bottom
             for pname in self.cfg.get("bottom_priority",["invalid","severe","dominated","low_score"]):
                 m=pmap.get(pname,torch.zeros_like(top))
                 for i in torch.where(m & (~top) & (~bottom))[0].tolist():

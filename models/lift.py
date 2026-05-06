@@ -928,9 +928,9 @@ class LIFT_Lightning(RL_Lightning):
         self.log("train-partition-ref-top-frac", top_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
         self.log("train-partition-ref-bottom-frac", bottom_mask.float().mean(), on_step=True, logger=True, sync_dist=True)
         for k, v in scoring_ref.component_scores.items():
-            self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log(f"train-mpo-ref-comp-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
         for k, v in scoring_ref.raw_properties.items():
-            self.log(f"train-mpo-ref-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
+            self.log(f"train-mpo-ref-raw-{k}-mean", v.mean(), on_step=True, logger=True, sync_dist=True)
         if "sim_ranolazine_AP" in scoring_ref.raw_properties:
             rs = scoring_ref.raw_properties["sim_ranolazine_AP"]; csim = scoring_ref.component_scores.get("sim_ranolazine_AP", rs)
             self.log("train-mpo-ref-all-raw-sim_ranolazine_AP-mean", rs.mean(), on_step=True, logger=True, sync_dist=True)

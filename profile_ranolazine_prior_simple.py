@@ -3,6 +3,7 @@ import argparse
 import csv
 import gc
 import json
+import os
 from pathlib import Path
 
 import lightning as L
@@ -70,6 +71,7 @@ def main():
     if not config_path.is_absolute():
         config_path = Path(__file__).resolve().parent / config_path
     gp = Update_PARAMS(GP, str(config_path))
+    os.environ["CUDA_VISIBLE_DEVICES"] = gp.CUDA_VISIBLE_DEVICES
 
     L.seed_everything(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")

@@ -51,6 +51,11 @@ def main():
     ap.add_argument("--gen_chunk_size", type=int, default=100)
     ap.add_argument("--score_device", type=str, default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--output_dir", type=str, default="prior_profile/Ranolazine_MPO")
+    ap.add_argument("--filter_start_by_atom_count", action="store_true")
+    ap.add_argument("--target_smiles", type=str, default=RANOLAZINE_SMILES)
+    ap.add_argument("--atom_count_tolerance", type=int, default=10)
+    ap.add_argument("--atom_count_with_h", action="store_true")
+    ap.add_argument("--min_start_pool_size", type=int, default=100)
     ap.add_argument("--conditions", type=str, default="1,2,3,4")
     ap.add_argument("--sim_threshold", type=float, default=0.7)
     ap.add_argument("--logp_threshold", type=float, default=7.0)
@@ -94,8 +99,46 @@ def main():
         scale_ot_factor=0.2, batchsize=args.batch_size, mini_batchsize=1,
         with_Hs=model.with_Hs, ot_geo_weight=model.ot_geo_weight, ot_type_weight=model.ot_type_weight, ot_bond_weight=model.ot_bond_weight,
     )
+    model.data_module.setup(stage="test")
+    full_test_mgs = list(model.data_module.testset.MGs)
     objective = build_objective("Ranolazine_MPO", {"aggregate": "geometric"})
     score_device = torch.device(args.score_device if (args.score_device == "cpu" or torch.cuda.is_available()) else "cpu")
+    target_mol = Chem.MolFromSmiles(args.target_smiles)
+    if args.atom_count_with_h and target_mol is not None:
+        target_mol = Chem.AddHs(target_mol)
+    target_num_atoms = target_mol.GetNumAtoms() if target_mol is not None else 0
+
+    def mg_num_atoms(mg):
+        if hasattr(mg, "natoms"):
+            return int(mg.natoms)
+        rm = mg.to_rdkit() if hasattr(mg, "to_rdkit") else None
+        if rm is None:
+            return 0
+        if args.atom_count_with_h:
+            rm = Chem.AddHs(rm)
+        return int(rm.GetNumAtoms())
+
+    start_pool_indices = list(range(len(full_test_mgs)))
+    start_pool_counts = [mg_num_atoms(mg) for mg in full_test_mgs]
+    if args.filter_start_by_atom_count:
+        start_pool_indices = [
+            i for i, c in enumerate(start_pool_counts)
+            if abs(c - target_num_atoms) <= args.atom_count_tolerance
+        ]
+        if len(start_pool_indices) < args.min_start_pool_size:
+            print(f"[WARN] filtered start pool too small: {len(start_pool_indices)} < {args.min_start_pool_size}")
+        pool_counts = [start_pool_counts[i] for i in start_pool_indices] if start_pool_indices else []
+        if pool_counts:
+            print(
+                f"[start-filter] target_num_atoms={target_num_atoms}, tol={args.atom_count_tolerance}, "
+                f"full={len(full_test_mgs)}, filtered={len(start_pool_indices)}, "
+                f"filtered atom min/mean/max={min(pool_counts)}/{sum(pool_counts)/len(pool_counts):.2f}/{max(pool_counts)}"
+            )
+        else:
+            print(f"[start-filter] no matched start pool, fallback to full test set.")
+            start_pool_indices = list(range(len(full_test_mgs)))
+    start_pool_size = len(start_pool_indices)
+    start_pool_atom_counts = [start_pool_counts[i] for i in start_pool_indices] if start_pool_indices else []
 
     ref = Chem.MolFromSmiles(RANOLAZINE_SMILES)
     ref_ap = Pairs.GetAtomPairFingerprint(ref)
@@ -115,7 +158,17 @@ def main():
         remaining = args.num_samples - generated_count
         cur_n = min(args.gen_chunk_size, remaining)
         try:
-            model.data_module.testset.sample(cur_n)
+            if args.filter_start_by_atom_count:
+                chosen = np.random.choice(start_pool_indices, size=cur_n, replace=(cur_n > len(start_pool_indices)))
+                model.data_module.testset.MGs = [full_test_mgs[int(i)] for i in chosen]
+                chosen_counts = [start_pool_counts[int(i)] for i in chosen]
+                print(
+                    f"[chunk {chunk_idx}] sampled start atom min/mean/max="
+                    f"{min(chosen_counts)}/{sum(chosen_counts)/len(chosen_counts):.2f}/{max(chosen_counts)}"
+                )
+            else:
+                model.data_module.testset.MGs = list(full_test_mgs)
+                model.data_module.testset.sample(cur_n)
             with torch.inference_mode():
                 cur_mols, _ = model.generate_molecules(lm, model.data_module, model.max_steps, stabilities=False)
             cur_mols = cur_mols[:cur_n]
@@ -213,6 +266,15 @@ def main():
             "tpsa_threshold": args.tpsa_threshold,
             "num_f_target": args.num_f_target,
         },
+        "start_filter_enabled": bool(args.filter_start_by_atom_count),
+        "target_smiles": args.target_smiles,
+        "target_num_atoms": int(target_num_atoms),
+        "atom_count_tolerance": int(args.atom_count_tolerance),
+        "atom_count_with_h": bool(args.atom_count_with_h),
+        "start_pool_size": int(start_pool_size),
+        "start_pool_atom_count_min": int(min(start_pool_atom_counts)) if start_pool_atom_counts else 0,
+        "start_pool_atom_count_mean": float(sum(start_pool_atom_counts) / len(start_pool_atom_counts)) if start_pool_atom_counts else 0.0,
+        "start_pool_atom_count_max": int(max(start_pool_atom_counts)) if start_pool_atom_counts else 0,
         "selected_conditions": selected_conditions,
         "condition_counts": condition_counts,
         "condition_fracs_valid": {k: float(v / max(1, num_valid)) for k, v in condition_counts.items()},

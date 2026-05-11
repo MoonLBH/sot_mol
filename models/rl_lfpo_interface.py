@@ -31,6 +31,7 @@ class MolGen_LFPOModel(MolGen_Model):
         objective_config=None,
         partition_config=None,
         metric_config=None,
+        archive_config=None,
         **kwargs,
     ):
         super().__init__(atom_tokens=atom_tokens, n_bond_types=n_bond_types, coord_std=coord_std, **kwargs)
@@ -47,6 +48,7 @@ class MolGen_LFPOModel(MolGen_Model):
         self.objective_config = objective_config or {}
         self.partition_config = partition_config or {}
         self.metric_config = metric_config or {}
+        self.archive_config = archive_config or {}
 
     def create_lightning_module(self, hparams=None, load_ckpt=None):
         default_hparams = {
@@ -72,6 +74,7 @@ class MolGen_LFPOModel(MolGen_Model):
             "objective_config": self.objective_config,
             "partition_config": self.partition_config,
             "metric_config": self.metric_config,
+            "archive_config": self.archive_config,
         }
         default_hparams.update(self.lfpo_hparams)
         if hparams is not None:

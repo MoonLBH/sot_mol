@@ -1,8 +1,8 @@
 from __future__ import annotations
 import argparse
 import csv
+import gc
 import json
-import math
 from pathlib import Path
 
 import lightning as L
@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--load_ckpt", type=str, required=True)
     ap.add_argument("--num_samples", type=int, default=10000)
     ap.add_argument("--batch_size", type=int, default=256)
+    ap.add_argument("--gen_chunk_size", type=int, default=100)
+    ap.add_argument("--score_device", type=str, default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--output_dir", type=str, default="prior_profile/Ranolazine_MPO")
     ap.add_argument("--conditions", type=str, default="1,2,3,4")
     ap.add_argument("--sim_threshold", type=float, default=0.7)
@@ -90,13 +92,8 @@ def main():
         scale_ot_factor=0.2, batchsize=args.batch_size, mini_batchsize=1,
         with_Hs=model.with_Hs, ot_geo_weight=model.ot_geo_weight, ot_type_weight=model.ot_type_weight, ot_bond_weight=model.ot_bond_weight,
     )
-    model.data_module.setup(stage="test")
-    model.data_module.testset.sample(args.num_samples)
-    mols, _ = model.generate_molecules(lm, model.data_module, model.max_steps, stabilities=False)
-    mols = mols[: args.num_samples]
-
     objective = build_objective("Ranolazine_MPO", {"aggregate": "geometric"})
-    scoring = objective.score_mols(mols, device=device, dtype=torch.float32)
+    score_device = torch.device(args.score_device if (args.score_device == "cpu" or torch.cuda.is_available()) else "cpu")
 
     ref = Chem.MolFromSmiles(RANOLAZINE_SMILES)
     ref_ap = Pairs.GetAtomPairFingerprint(ref)
@@ -109,34 +106,73 @@ def main():
     valid_mols = []
     matched_mols = []
     matched_rows = []
-    for i in range(args.num_samples):
-        valid = bool(scoring.valid[i].item())
-        connected = bool(scoring.connected[i].item())
-        cs = scoring.canonical_smiles[i]
-        rs = float(scoring.raw_properties["sim_ranolazine_AP"][i].item()) if valid else float("nan")
-        lp = float(scoring.raw_properties["logP"][i].item()) if valid else float("nan")
-        tp = float(scoring.raw_properties["TPSA"][i].item()) if valid else float("nan")
-        nf = float(scoring.raw_properties["num_F"][i].item()) if valid else float("nan")
-        c1 = valid and (rs >= args.sim_threshold)
-        c2 = valid and (lp >= args.logp_threshold)
-        c3 = valid and (tp >= args.tpsa_threshold)
-        c4 = valid and (nf == float(args.num_f_target))
-        cond_map = {1: c1, 2: c2, 3: c3, 4: c4}
-        selected_pass = valid and all(cond_map[c] for c in selected_conditions)
-        row = {
-            "idx": i, "valid": valid, "connected": connected,
-            "smiles": Chem.MolToSmiles(mols[i]) if mols[i] is not None else "",
-            "canonical_smiles": cs or "",
-            "raw_sim_ranolazine_AP": rs, "raw_logP": lp, "raw_TPSA": tp, "raw_num_F": nf,
-            "cond1_sim_pass": c1, "cond2_logp_pass": c2, "cond3_tpsa_pass": c3, "cond4_num_f_pass": c4,
-            "selected_conditions_pass": selected_pass,
-        }
-        rows.append(row)
-        if valid and mols[i] is not None:
-            valid_mols.append(mols[i])
-        if selected_pass and mols[i] is not None:
-            matched_mols.append(mols[i])
-            matched_rows.append(row)
+    generated_count = 0
+    chunk_idx = 0
+    while generated_count < args.num_samples:
+        chunk_idx += 1
+        remaining = args.num_samples - generated_count
+        cur_n = min(args.gen_chunk_size, remaining)
+        try:
+            model.data_module.testset.sample(cur_n)
+            with torch.inference_mode():
+                cur_mols, _ = model.generate_molecules(lm, model.data_module, model.max_steps, stabilities=False)
+            cur_mols = cur_mols[:cur_n]
+            scoring = objective.score_mols(cur_mols, device=score_device, dtype=torch.float32)
+        except torch.OutOfMemoryError:
+            print("[OOM] CUDA out of memory during generation/scoring.")
+            print("Please reduce --batch_size or --gen_chunk_size and retry.")
+            raise SystemExit(1)
+
+        chunk_valid = 0
+        chunk_selected = 0
+        for local_i in range(cur_n):
+            global_idx = generated_count + local_i
+            valid = bool(scoring.valid[local_i].item())
+            connected = bool(scoring.connected[local_i].item())
+            cs = scoring.canonical_smiles[local_i]
+            rs = float(scoring.raw_properties["sim_ranolazine_AP"][local_i].item()) if valid else float("nan")
+            lp = float(scoring.raw_properties["logP"][local_i].item()) if valid else float("nan")
+            tp = float(scoring.raw_properties["TPSA"][local_i].item()) if valid else float("nan")
+            nf = float(scoring.raw_properties["num_F"][local_i].item()) if valid else float("nan")
+            if valid:
+                chunk_valid += 1
+            cond_map = {}
+            c1 = valid and (rs >= args.sim_threshold)
+            c2 = valid and (lp >= args.logp_threshold)
+            c3 = valid and (tp >= args.tpsa_threshold)
+            c4 = valid and (nf == float(args.num_f_target))
+            cond_map = {1: c1, 2: c2, 3: c3, 4: c4}
+            selected_pass = valid and all(cond_map[c] for c in selected_conditions)
+            if selected_pass:
+                chunk_selected += 1
+            row = {
+                "idx": global_idx, "valid": valid, "connected": connected,
+                "smiles": Chem.MolToSmiles(cur_mols[local_i]) if cur_mols[local_i] is not None else "",
+                "canonical_smiles": cs or "",
+                "raw_sim_ranolazine_AP": rs, "raw_logP": lp, "raw_TPSA": tp, "raw_num_F": nf,
+                "cond1_sim_pass": c1, "cond2_logp_pass": c2, "cond3_tpsa_pass": c3, "cond4_num_f_pass": c4,
+                "selected_conditions_pass": selected_pass,
+            }
+            rows.append(row)
+            if valid and cur_mols[local_i] is not None:
+                valid_mols.append(cur_mols[local_i])
+            if selected_pass and cur_mols[local_i] is not None:
+                matched_mols.append(cur_mols[local_i])
+                matched_rows.append(row)
+
+        generated_count += cur_n
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserv = torch.cuda.memory_reserved() / (1024 ** 2)
+            free = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_reserved()) / (1024 ** 2)
+            print(f"[chunk {chunk_idx}] generated {generated_count} / {args.num_samples}, valid {chunk_valid}, selected {chunk_selected}, cuda allocated/reserved/free(MB)= {alloc:.1f}/{reserv:.1f}/{free:.1f}")
+        else:
+            print(f"[chunk {chunk_idx}] generated {generated_count} / {args.num_samples}, valid {chunk_valid}, selected {chunk_selected}, cuda n/a")
+
+        del cur_mols, scoring
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
     csv_path = outdir / args.csv_name
     with csv_path.open("w", newline="") as f:
